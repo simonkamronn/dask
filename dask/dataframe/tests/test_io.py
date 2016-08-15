@@ -1549,3 +1549,13 @@ def test_read_csv_singleton_dtype():
     with filetext(data, mode='wb') as fn:
         eq(pd.read_csv(fn, dtype=float),
            dd.read_csv(fn, dtype=float))
+
+
+def test_to_bcolz():
+    n = 100
+    ddf = dd.from_pandas(pd.DataFrame(np.array([np.zeros(n), np.zeros(n)]).T,
+                         columns=['a', 'b']), npartitions=2)
+    ddf.to_bcolz('tmp.bcolz', compute=True, reset_index=False)
+
+    tm.assert_frame_equal(ddf.compute(), dd.from_bcolz('tmp.bcolz', chunksize=50).compute())
+    shutil.rmtree('tmp.bcolz')

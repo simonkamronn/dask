@@ -9,11 +9,11 @@ import pytest
 import dask
 from dask.async import get_sync
 from dask import delayed
-from dask.utils import raises, ignoring
+from dask.utils import raises, ignoring, put_lines
 import dask.dataframe as dd
 
 from dask.dataframe.core import (repartition_divisions, _loc, aca, reduction,
-                                 _concat, _Frame)
+                                 _concat, _Frame, Scalar)
 from dask.dataframe.utils import eq, make_meta
 
 
@@ -126,6 +126,22 @@ def test_Index():
         assert eq(ddf.index, case.index)
         assert repr(ddf.index).startswith('dd.Index')
         assert raises(AttributeError, lambda: ddf.index.index)
+
+
+def test_Scalar():
+    val = np.int64(1)
+    s = Scalar({('a', 0): val}, 'a', 'i8')
+    assert hasattr(s, 'dtype')
+    assert 'dtype' in dir(s)
+    assert eq(s, val)
+    assert repr(s) == "dd.Scalar<a, dtype=int64>"
+
+    val = pd.Timestamp('2001-01-01')
+    s = Scalar({('a', 0): val}, 'a', val)
+    assert not hasattr(s, 'dtype')
+    assert 'dtype' not in dir(s)
+    assert eq(s, val)
+    assert repr(s) == "dd.Scalar<a, type=Timestamp>"
 
 
 def test_attributes():
@@ -505,7 +521,7 @@ def test_map_partitions_keeps_kwargs_in_dict():
     b = a.x.map_partitions(f, x=5)
 
     assert "'x': 5" in str(b.dask)
-    eq(df.x + 5, b)
+    assert eq(df.x + 5, b)
 
     assert a.x.map_partitions(f, x=5)._name != a.x.map_partitions(f, x=6)._name
 
@@ -728,20 +744,40 @@ def test_index():
 
 
 def test_assign():
+    d_unknown = dd.from_pandas(full, npartitions=3, sort=False)
+    assert not d_unknown.known_divisions
     res = d.assign(c=1,
                    d='string',
-                   e=np.float64(1),
-                   f=d.a.sum(),
-                   g=d.a + 1,
-                   h=d.a + d.b)
+                   e=d.a.sum(),
+                   f=d.a + d.b)
+    res_unknown = d_unknown.assign(c=1,
+                                   d='string',
+                                   e=d_unknown.a.sum(),
+                                   f=d_unknown.a + d_unknown.b)
     sol = full.assign(c=1,
                       d='string',
-                      e=np.float64(1),
-                      f=full.a.sum(),
-                      g=full.a + 1,
-                      h=full.a + full.b)
+                      e=full.a.sum(),
+                      f=full.a + full.b)
     assert eq(res, sol)
-    pytest.raises(TypeError, lambda: d.assign(c=list(range(9))))
+    assert eq(res_unknown, sol)
+
+    res = d.assign(c=full.a + 1)
+    assert eq(res, full.assign(c=full.a + 1))
+
+    # divisions unknown won't work with pandas
+    with pytest.raises(ValueError):
+        d_unknown.assign(c=full.a + 1)
+
+    # unsupported type
+    with pytest.raises(TypeError):
+        d.assign(c=list(range(9)))
+
+    # Fails when assigning known divisions to unknown divisions
+    with pytest.raises(ValueError):
+        d_unknown.assign(foo=d.a)
+    # Fails when assigning unknown divisions to known divisions
+    with pytest.raises(ValueError):
+        d.assign(foo=d_unknown.a)
 
 
 def test_map():
@@ -1416,6 +1452,12 @@ def test_aca_meta_infer():
     sol = (df + 2.0 + 2.0).head()
     assert eq(res, sol)
 
+    # Should infer as a scalar
+    res = aca([ddf.x], chunk=lambda x: pd.Series([x.sum()]),
+              aggregate=lambda x: x.sum())
+    assert isinstance(res, Scalar)
+    assert res.compute() == df.x.sum()
+
 
 def test_gh_517():
     arr = np.random.randn(100, 2)
@@ -1541,6 +1583,18 @@ def test_corr():
 
     pytest.raises(NotImplementedError, lambda: da.corr(db, method='spearman'))
     pytest.raises(TypeError, lambda: da.corr(ddf))
+
+
+def test_cov_corr_meta():
+    df = pd.DataFrame({'a': np.array([1, 2, 3]),
+                       'b': np.array([1.0, 2.0, 3.0], dtype='f4'),
+                       'c': np.array([1.0, 2.0, 3.0])},
+                       index=pd.Index([1, 2, 3], name='myindex'))
+    ddf = dd.from_pandas(df, npartitions=2)
+    eq(ddf.corr(), df.corr())
+    eq(ddf.cov(), df.cov())
+    assert ddf.a.cov(ddf.b)._meta.dtype == 'f8'
+    assert ddf.a.corr(ddf.b)._meta.dtype == 'f8'
 
 
 @pytest.mark.slow
@@ -1769,15 +1823,48 @@ def test_sorted_index_single_partition():
         df.set_index('x'))
 
 
-def test_info(capsys):
-    df = pd.DataFrame({'long_column_name': [1, 2, 3, 4], 'short_name': [1, 0, 1, 0]})
-    ddf = dd.from_pandas(df, npartitions=1)
-    ddf.info()
-    out, err = capsys.readouterr()
-    assert out == ("<class 'dask.dataframe.core.DataFrame'>\n"
-                  "Data columns (total 2 columns):\n"
-                  "long_column_name    int64\n"
-                  "short_name          int64\n")
+def test_info():
+    from io import StringIO
+    from dask.compatibility import unicode
+
+    # TODO This should be fixed in pandas 0.18.2
+    if pd.__version__ == '0.18.0':
+        from pandas.core import format
+    else:
+        from pandas.formats import format
+    format._put_lines = put_lines
+
+    test_frames = [
+        pd.DataFrame({'x': [1, 2, 3, 4], 'y': [1, 0, 1, 0]}, index=pd.Int64Index(range(4))),  # No RangeIndex in dask
+        pd.DataFrame()
+    ]
+
+    for df in test_frames:
+        buf_pd, buf_da = StringIO(), StringIO()
+
+        ddf = dd.from_pandas(df, npartitions=4)
+        df.info(buf=buf_pd)
+        ddf.info(buf=buf_da, verbose=True, memory_usage=True)
+
+        stdout_pd = buf_pd.getvalue()
+        stdout_da = buf_da.getvalue()
+        stdout_da = stdout_da.replace(str(type(ddf)), str(type(df)))
+
+        assert stdout_pd == stdout_da
+
+    buf = StringIO()
+    ddf = dd.from_pandas(pd.DataFrame({'x': [1, 2, 3, 4], 'y': [1, 0, 1, 0]}, index=range(4)), npartitions=4)
+
+    # Verbose=False
+    ddf.info(buf=buf, verbose=False)
+    assert buf.getvalue() == unicode("<class 'dask.dataframe.core.DataFrame'>\n"
+                                     "Data columns (total 2 columns):\n"
+                                     "x      int64\n"
+                                     "y      int64\n"
+                                     "dtypes: int64(2)")
+
+    # buf=None
+    assert ddf.info(buf=None) is None
 
 
 def test_gh_1301():
@@ -1821,3 +1908,22 @@ def test_columns_assignment():
     ddf[['a', 'b']] = ddf2[['y', 'z']]
 
     eq(df, ddf)
+
+
+@pytest.mark.parametrize("skipna", [True, False])
+@pytest.mark.parametrize("idx", [
+    np.arange(100),
+    sorted(np.random.random(size=100)),
+    pd.date_range('20150101', periods=100)
+])
+def test_idxmaxmin(idx, skipna):
+    pdf = pd.DataFrame(np.random.randn(100, 5), columns=list('abcde'), index=idx)
+    pdf.b.iloc[31] = np.nan
+    pdf.d.iloc[78] = np.nan
+    ddf = dd.from_pandas(pdf, npartitions=3)
+    assert eq(pdf.idxmax(skipna=skipna), ddf.idxmax(skipna=skipna))
+    assert eq(pdf.idxmin(skipna=skipna), ddf.idxmin(skipna=skipna))
+    assert eq(pdf.idxmax(axis=1, skipna=skipna), ddf.idxmax(axis=1, skipna=skipna))
+    assert eq(pdf.idxmin(axis=1, skipna=skipna), ddf.idxmin(axis=1, skipna=skipna))
+    assert eq(pdf.a.idxmax(skipna=skipna), ddf.a.idxmax(skipna=skipna))
+    assert eq(pdf.a.idxmin(skipna=skipna), ddf.a.idxmin(skipna=skipna))

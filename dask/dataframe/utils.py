@@ -229,7 +229,7 @@ _simple_fake_mapping = {
     'b': np.bool_(True),
     'V': np.void(b' '),
     'M': np.datetime64('1970-01-01'),
-    'm': np.timedelta64(1, 'D'),
+    'm': np.timedelta64(1),
     'S': np.str_('foo'),
     'a': np.str_('foo'),
     'U': np.unicode_('foo'),
@@ -242,7 +242,8 @@ def _scalar_from_dtype(dtype):
     elif dtype.kind == 'c':
         return dtype.type(complex(1, 0))
     elif dtype.kind in _simple_fake_mapping:
-        return _simple_fake_mapping[dtype.kind]
+        o = _simple_fake_mapping[dtype.kind]
+        return o.astype(dtype) if dtype.kind in ('m', 'M') else o
     else:
         raise TypeError("Can't handle dtype: {0}".format(dtype))
 
@@ -276,7 +277,7 @@ def _nonempty_series(s, idx):
                                ordered=s.cat.ordered)
     else:
         entry = _scalar_from_dtype(dtype)
-        data = [entry, entry]
+        data = np.array([entry, entry], dtype=dtype)
     return pd.Series(data, name=s.name, index=idx)
 
 
@@ -366,9 +367,11 @@ def _maybe_sort(a):
     return a.sort_index()
 
 
-def eq(a, b, check_names=True, check_dtypes=True, **kwargs):
-    assert_divisions(a)
-    assert_divisions(b)
+def eq(a, b, check_names=True, check_dtypes=True, check_divisions=True,
+       **kwargs):
+    if check_divisions:
+        assert_divisions(a)
+        assert_divisions(b)
     assert_sane_keynames(a)
     assert_sane_keynames(b)
     a = _check_dask(a, check_names=check_names, check_dtypes=check_dtypes)

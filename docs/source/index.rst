@@ -2,16 +2,28 @@
 Dask
 ====
 
-Dask is a flexible parallel computing library for analytics.  Dask emphasizes
-the following virtues:
+*Dask is a flexible parallel computing library for analytic computing.*
+
+Dask is composed of two components:
+
+1.  **Dynamic task scheduling** optimized for computation.  This is similar to
+    *Airflow, Luigi, Celery, or Make*, but optimized for interactive
+    computational workloads.
+2.  **"Big Data" collections** like parallel arrays, dataframes, and lists that
+    extend common interfaces like *NumPy, Pandas, or Python iterators* to
+    larger-than-memory or distributed environments.  These parallel collections
+    run on top of the dynamic task schedulers.
+
+Dask emphasizes the following virtues:
 
 *  **Familiar**: Provides parallelized NumPy array and Pandas DataFrame objects
+*  **Flexible**: Provides a task scheduling interface for more custom workloads
+   and integration with other projects.
 *  **Native**: Enables distributed computing in Pure Python with access to
    the PyData stack.
 *  **Fast**: Operates with low overhead, low latency, and minimal serialization
    necessary for fast numerical algorithms
-*  **Flexible**: Supports complex and messy workloads
-*  **Scales up**: Runs resiliently on clusters with 100s of nodes
+*  **Scales up**: Runs resiliently on clusters with 1000s of cores
 *  **Scales down**: Trivial to set up and run on a laptop in a single process
 *  **Responsive**: Designed with interactive computing in mind it provides rapid
    feedback and diagnostics to aid humans
@@ -22,6 +34,9 @@ the following virtues:
    :width: 80%
    :align: center
 
+See the `dask.distributed documentation (separate website)
+<http://distributed.readthedocs.io/en/latest/>`_ for more technical information
+on Dask's distributed scheduler,
 
 Familiar user interface
 -----------------------
@@ -44,7 +59,7 @@ Familiar user interface
                                                               chunks=(1000, 1000))
    x - x.mean(axis=1)                       x - x.mean(axis=1).compute()
 
-**Dask Bag** mimics iterators, Toolz, PySpark
+**Dask Bag** mimics iterators, Toolz, and PySpark
 
 .. code-block:: python
 
@@ -64,6 +79,22 @@ Familiar user interface
 
    result = delayed(summarize)(L)
    result.compute()
+
+The **concurrent.futures** interface provides general submission of custom
+tasks:
+
+.. code-block:: python
+
+   from dask.distributed import Executor
+   e = Executor('scheduler:port')
+
+   futures = []
+   for fn in filenames:
+       future = e.submit(load, fn)
+       futures.append(future)
+
+   summary = e.submit(summarize, futures)
+   summary.result()
 
 
 Scales from laptops to clusters
@@ -136,30 +167,6 @@ then you should start here.
    dataframe.rst
    delayed.rst
 
-**Graphs**
-
-Dask graphs encode algorithms in a simple format involving Python dicts,
-tuples, and functions.  This graph format can be used in isolation from the
-dask collections.  Working directly with dask graphs is an excellent way to
-implement and test new algorithms in fields such as linear algebra,
-optimization, and machine learning.  If you are a *developer*, you should start
-here.
-
-* :doc:`graphs`
-* :doc:`spec`
-* :doc:`custom-graphs`
-* :doc:`optimize`
-
-.. toctree::
-   :maxdepth: 1
-   :hidden:
-   :caption: Graphs
-
-   graphs.rst
-   spec.rst
-   custom-graphs.rst
-   optimize.rst
-
 **Scheduling**
 
 Schedulers execute task graphs.  Dask currently has two main schedulers, one
@@ -198,8 +205,32 @@ help make debugging and profiling graph execution easier.
    inspect.rst
    diagnostics.rst
 
+**Graphs**
+
+Internally Dask encodes algorithms in a simple format involving Python dicts,
+tuples, and functions.  This graph format can be used in isolation from the
+dask collections.  Working directly with dask graphs is rare unless you intend
+to develop new modules with Dask.  Even then, :doc:`dask.delayed <delayed>` is
+often a better choice.  If you are a *core developer*, then you should start here.
+
+* :doc:`graphs`
+* :doc:`spec`
+* :doc:`custom-graphs`
+* :doc:`optimize`
+
+.. toctree::
+   :maxdepth: 1
+   :hidden:
+   :caption: Graphs
+
+   graphs.rst
+   spec.rst
+   custom-graphs.rst
+   optimize.rst
+
 **Help & reference**
 
+* :doc:`changelog`
 * :doc:`support`
 * :doc:`develop`
 * :doc:`faq`
@@ -213,6 +244,7 @@ help make debugging and profiling graph execution easier.
    :hidden:
    :caption: Help & reference
 
+   changelog.rst
    support.rst
    develop.rst
    faq.rst

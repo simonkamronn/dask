@@ -32,6 +32,9 @@ def tsqr(data, name=None, compute_svd=False):
     Singular Value Decomposition.  It requires that the input array have a
     single column of blocks, each of which fit in memory.
 
+    If blocks are of size ``(n, k)`` then this algorithm has memory use that
+    scales as ``n**2 * k * nthreads``.
+
     Parameters
     ----------
 
@@ -49,7 +52,7 @@ def tsqr(data, name=None, compute_svd=False):
     if not (data.ndim == 2 and                    # Is a matrix
             len(data.chunks[1]) == 1):         # Only one column block
         raise ValueError(
-            "Input must have the following properites:\n"
+            "Input must have the following properties:\n"
             "  1. Have two dimensions\n"
             "  2. Have only one column of blocks")
 

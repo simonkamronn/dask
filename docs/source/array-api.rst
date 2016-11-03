@@ -115,8 +115,10 @@ Top level user functions:
    ravel
    real
    rechunk
+   repeat
    reshape
    rint
+   round
    sign
    signbit
    sin
@@ -430,7 +432,6 @@ Other functions
 .. autofunction:: pareto
 .. autofunction:: poisson
 .. autofunction:: power
-.. autofunction:: product
 .. autofunction:: random
 .. autofunction:: random_sample
 .. autofunction:: rayleigh

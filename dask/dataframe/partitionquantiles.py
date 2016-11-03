@@ -76,7 +76,7 @@ import pandas as pd
 
 from toolz import merge, merge_sorted, take
 
-from ..utils import different_seeds
+from ..utils import random_state_data
 from ..base import tokenize
 from .core import Series
 from dask.compatibility import zip
@@ -186,15 +186,15 @@ def tree_groups(N, num_groups):
     group_size = N // num_groups
     dx = num_groups
     dy = N - group_size * num_groups
-    D = 2*dy - dx
+    D = 2 * dy - dx
     rv = []
     for _ in range(num_groups):
         if D < 0:
             rv.append(group_size)
         else:
             rv.append(group_size + 1)
-            D -= 2*dx
-        D += 2*dy
+            D -= 2 * dx
+        D += 2 * dy
     return rv
 
 
@@ -227,7 +227,7 @@ def create_merge_tree(func, keys, token):
         groups = tree_groups(prev_width, width)
         keys = [(token, level, i) for i in range(width)]
         rv.update((key, (func, list(take(num, prev_keys))))
-                   for num, key in zip(groups, keys))
+                  for num, key in zip(groups, keys))
         prev_width = width
         prev_keys = iter(keys)
         level += 1
@@ -372,7 +372,7 @@ def process_val_weights(vals_and_weights, npartitions, dtype_info):
     return rv
 
 
-def percentiles_summary(df, num_old, num_new, upsample=1.0, random_state=None):
+def percentiles_summary(df, num_old, num_new, upsample, state):
     """Summarize data using percentiles and derived weights.
 
     These summaries can be merged, compressed, and converted back into
@@ -394,6 +394,7 @@ def percentiles_summary(df, num_old, num_new, upsample=1.0, random_state=None):
     length = len(df)
     if length == 0:
         return ()
+    random_state = np.random.RandomState(state)
     qs = sample_percentiles(num_old, num_new, length, upsample, random_state)
     data = df.values
     interpolation = 'linear'
@@ -427,7 +428,7 @@ def partition_quantiles(df, npartitions, upsample=1.0, random_state=None):
     token = tokenize(df, qs, upsample)
     if random_state is None:
         random_state = hash(token) % np.iinfo(np.int32).max
-    seeds = different_seeds(df.npartitions, random_state)
+    state_data = random_state_data(df.npartitions, random_state)
 
     df_keys = df._keys()
 
@@ -435,9 +436,9 @@ def partition_quantiles(df, npartitions, upsample=1.0, random_state=None):
     dtype_dsk = {(name0, 0): (dtype_info, df_keys[0])}
 
     name1 = 're-quantiles-1-' + token
-    val_dsk = dict(((name1, i), (percentiles_summary, key, df.npartitions,
-                                 npartitions, upsample, seeds[i]))
-                   for i, key in enumerate(df_keys))
+    val_dsk = {(name1, i): (percentiles_summary, key, df.npartitions,
+                            npartitions, upsample, state)
+               for i, (state, key) in enumerate(zip(state_data, df_keys))}
 
     name2 = 're-quantiles-2-' + token
     merge_dsk = create_merge_tree(merge_and_compress_summaries, sorted(val_dsk), name2)

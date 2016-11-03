@@ -12,10 +12,12 @@ Easy Case
 
 To start off, common groupby operations like
 ``df.groupby(columns).reduction()`` for known reductions like ``mean, sum, std,
-var, count, nunique`` are all quite fast and efficient.  This is the common
-case.  So too with joins.  Joining a Dask dataframe to a Pandas dataframe or
-joining two Dask dataframes along their index is already quite fast.  No
-special considerations need to be made when operating in these common cases.
+var, count, nunique`` are all quite fast and efficient, even if partitions are
+not cleanly divided with known divisions.  This is the common case.
+
+Joins are also quite fast when joining a Dask dataframe to a Pandas dataframe
+or when joining two Dask dataframes along their index.  No special
+considerations need to be made when operating in these common cases.
 
 So if you're doing common groupby and join operations then you can stop reading
 this.  Everything will scale nicely.  Fortunately this is true most of the
@@ -79,16 +81,16 @@ Selecting methods
 
 Dask will use on-disk shuffling by default but will switch to task-based
 distributed shuffling if the default scheduler is set to use a
-``dask.distributed.Executor`` such as would be the case if the user sets the
-Executor as default using one of the following two options:
+``dask.distributed.Client`` such as would be the case if the user sets the
+Client as default using one of the following two options:
 
 .. code-block:: python
 
-    e = Executor('scheduler:8786', set_as_default=True)
+    client = Client('scheduler:8786', set_as_default=True)
 
     or
 
-    dask.set_options(get=e.get)
+    dask.set_options(get=client.get)
 
 Alternatively, if you prefer to avoid defaults, you can specify a ``method=``
 keyword argument to ``groupby`` or ``set_index``

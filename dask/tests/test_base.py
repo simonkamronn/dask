@@ -8,7 +8,8 @@ import sys
 import dask
 from dask.base import (compute, tokenize, normalize_token, normalize_function,
                        visualize)
-from dask.utils import raises, tmpdir, tmpfile, ignoring
+from dask.utils import tmpdir, tmpfile, ignoring
+from dask.utils_test import inc, dec
 from dask.compatibility import unicode
 
 
@@ -26,10 +27,13 @@ pd = import_or_none('pandas')
 
 
 def test_normalize_function():
+
     def f1(a, b, c=1):
         pass
+
     def f2(a, b=1, c=2):
         pass
+
     def f3(a):
         pass
 
@@ -67,8 +71,8 @@ def test_tokenize():
 
 @pytest.mark.skipif('not np')
 def test_tokenize_numpy_array_consistent_on_values():
-    assert tokenize(np.random.RandomState(1234).random_sample(1000)) == \
-           tokenize(np.random.RandomState(1234).random_sample(1000))
+    assert (tokenize(np.random.RandomState(1234).random_sample(1000)) ==
+            tokenize(np.random.RandomState(1234).random_sample(1000)))
 
 
 @pytest.mark.skipif('not np')
@@ -89,21 +93,21 @@ def test_tokenize_numpy_datetime():
 @pytest.mark.skipif('not np')
 def test_tokenize_numpy_scalar():
     assert tokenize(np.array(1.0, dtype='f8')) == tokenize(np.array(1.0, dtype='f8'))
-    assert (tokenize(np.array([(1, 2)], dtype=[('a', 'i4'), ('b', 'i8')])[0])
-         == tokenize(np.array([(1, 2)], dtype=[('a', 'i4'), ('b', 'i8')])[0]))
+    assert (tokenize(np.array([(1, 2)], dtype=[('a', 'i4'), ('b', 'i8')])[0]) ==
+            tokenize(np.array([(1, 2)], dtype=[('a', 'i4'), ('b', 'i8')])[0]))
 
 
 @pytest.mark.skipif('not np')
 def test_tokenize_numpy_array_on_object_dtype():
-    assert tokenize(np.array(['a', 'aa', 'aaa'], dtype=object)) == \
-           tokenize(np.array(['a', 'aa', 'aaa'], dtype=object))
-    assert tokenize(np.array(['a', None, 'aaa'], dtype=object)) == \
-           tokenize(np.array(['a', None, 'aaa'], dtype=object))
-    assert tokenize(np.array([(1, 'a'), (1, None), (1, 'aaa')], dtype=object)) == \
-           tokenize(np.array([(1, 'a'), (1, None), (1, 'aaa')], dtype=object))
+    assert (tokenize(np.array(['a', 'aa', 'aaa'], dtype=object)) ==
+            tokenize(np.array(['a', 'aa', 'aaa'], dtype=object)))
+    assert (tokenize(np.array(['a', None, 'aaa'], dtype=object)) ==
+            tokenize(np.array(['a', None, 'aaa'], dtype=object)))
+    assert (tokenize(np.array([(1, 'a'), (1, None), (1, 'aaa')], dtype=object)) ==
+            tokenize(np.array([(1, 'a'), (1, None), (1, 'aaa')], dtype=object)))
     if sys.version_info[0] == 2:
-        assert tokenize(np.array([unicode("Rebeca Alón", encoding="utf-8")], dtype=object)) == \
-               tokenize(np.array([unicode("Rebeca Alón", encoding="utf-8")], dtype=object))
+        assert (tokenize(np.array([unicode("Rebeca Alón", encoding="utf-8")], dtype=object)) ==
+                tokenize(np.array([unicode("Rebeca Alón", encoding="utf-8")], dtype=object)))
 
 
 @pytest.mark.skipif('not np')
@@ -119,6 +123,32 @@ def test_tokenize_numpy_memmap():
         z = tokenize(np.load(fn, mmap_mode='r'))
 
     assert y != z
+
+    with tmpfile('.npy') as fn:
+        x = np.random.normal(size=(10, 10))
+        np.save(fn, x)
+        mm = np.load(fn, mmap_mode='r')
+        mm2 = np.load(fn, mmap_mode='r')
+        a = tokenize(mm[0, :])
+        b = tokenize(mm[1, :])
+        c = tokenize(mm[0:3, :])
+        d = tokenize(mm[:, 0])
+        assert len(set([a, b, c, d])) == 4
+        assert tokenize(mm) == tokenize(mm2)
+        assert tokenize(mm[1, :]) == tokenize(mm2[1, :])
+
+
+@pytest.mark.skipif('not np')
+def test_tokenize_numpy_memmap_no_filename():
+    # GH 1562:
+    with tmpfile('.npy') as fn1, tmpfile('.npy') as fn2:
+        x = np.arange(5)
+        np.save(fn1, x)
+        np.save(fn2, x)
+
+        a = np.load(fn1, mmap_mode='r')
+        b = a + a
+        assert tokenize(b) == tokenize(b)
 
 
 def test_normalize_base():
@@ -152,8 +182,10 @@ def test_tokenize_kwargs():
 
 def test_tokenize_same_repr():
     class Foo(object):
+
         def __init__(self, x):
             self.x = x
+
         def __repr__(self):
             return 'a foo'
 
@@ -249,7 +281,7 @@ def test_compute_array_bag():
     x = da.arange(5, chunks=2)
     b = db.from_sequence([1, 2, 3])
 
-    assert raises(ValueError, lambda: compute(x, b))
+    pytest.raises(ValueError, lambda: compute(x, b))
 
     xx, bb = compute(x, b, get=dask.async.get_sync)
     assert np.allclose(xx, np.arange(5))
@@ -301,3 +333,19 @@ def test_use_cloudpickle_to_tokenize_functions_in__main__():
 
     t = normalize_token(f)
     assert b'__main__' not in t
+
+
+def test_optimizations_keyword():
+    def inc_to_dec(dsk, keys):
+        for key in dsk:
+            if dsk[key][0] == inc:
+                dsk[key] = (dec,) + dsk[key][1:]
+        return dsk
+
+    x = dask.delayed(inc)(1)
+    assert x.compute() == 2
+
+    with dask.set_options(optimizations=[inc_to_dec]):
+        assert x.compute() == 0
+
+    assert x.compute() == 2

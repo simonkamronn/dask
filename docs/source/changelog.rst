@@ -9,10 +9,14 @@ DataFrame
 - Return a series when functions given to ``dataframe.map_partitions`` return
   scalars (:pr:`1514`)
 - Fix type size inference for series (:pr:`1513`)
+- ``dataframe.DataFrame.categorize`` no longer includes missing values
+  in the ``categories``. This is for compatibility with a `pandas change<https://github.com/pydata/pandas/pull/10929>` (:pr:`1565`)
 - Fix head parser error in ``dataframe.read_csv`` when some lines have quotes
   (:pr:`1495`)
 - Add ``dataframe.reduction`` and ``series.reduction`` methods to apply generic
   row-wise reduction to dataframes and series (:pr:`1483`)
+- Add ``dataframe.select_dtypes``, which mirrors the `pandas method<http://pandas.pydata.org/pandas-docs/version/0.18.1/generated/pandas.DataFrame.select_dtypes.html>`_ (:pr:`1556`)
+- ``dataframe.read_hdf`` now supports reading ``Series`` (:pr:`1564`)
 
 Distributed
 +++++++++++
@@ -23,6 +27,8 @@ Array
 +++++
 - Add information about how ``dask.array`` ``chunks`` argument work (:pr:`1504`)
 - Fix field access with non-scalar fields in ``dask.array`` (:pr:`1484`)
+- Add concatenate= keyword to atop to concatenate chunks of contracted dimensions
+- Add new_axes= keyword to atop to support adding new dimensions
 
 Bag
 ++++
@@ -307,7 +313,7 @@ This release also includes a deprecation warning for ``dask.distributed``, which
 will be removed in the next version.
 
 Future development in distributed computing for dask is happening here:
-http://distributed.readthedocs.org . General feedback on that project is most
+https://distributed.readthedocs.io . General feedback on that project is most
 welcome from this community.
 
 0.7.3 / 2015-09-25

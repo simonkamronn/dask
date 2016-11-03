@@ -5,17 +5,28 @@ from distutils.version import LooseVersion
 
 from collections import Iterator
 import sys
+import traceback
+from contextlib import contextmanager
+import warnings
 
 import numpy as np
 import pandas as pd
 import pandas.util.testing as tm
-from pandas.core.common import is_datetime64tz_dtype, is_categorical_dtype
+from pandas.core.common import is_datetime64tz_dtype
 import toolz
 
+from ..core import get_deps
 from ..async import get_sync
 
 
 PANDAS_VERSION = LooseVersion(pd.__version__)
+if PANDAS_VERSION >= '0.19.0':
+    PANDAS_ge_0190 = True
+    from pandas.api.types import is_categorical_dtype, is_scalar       # noqa
+else:
+    PANDAS_ge_0190 = False
+    from pandas.core.common import is_categorical_dtype                # noqa
+    is_scalar = pd.lib.isscalar                                        # noqa
 
 
 def shard_df_on_index(df, divisions):
@@ -56,7 +67,6 @@ def shard_df_on_index(df, divisions):
     3  30  2
     4  40  1
     """
-    from dask.dataframe.categorical import iscategorical
 
     if isinstance(divisions, Iterator):
         divisions = list(divisions)
@@ -66,12 +76,12 @@ def shard_df_on_index(df, divisions):
         divisions = np.array(divisions)
         df = df.sort_index()
         index = df.index
-        if iscategorical(index.dtype):
+        if is_categorical_dtype(index):
             index = index.as_ordered()
         indices = index.searchsorted(divisions)
         yield df.iloc[:indices[0]]
         for i in range(len(indices) - 1):
-            yield df.iloc[indices[i]: indices[i+1]]
+            yield df.iloc[indices[i]: indices[i + 1]]
         yield df.iloc[indices[-1]:]
 
 
@@ -92,7 +102,8 @@ def unique(divisions):
         return np.unique(divisions)
     if isinstance(divisions, pd.Categorical):
         return pd.Categorical.from_codes(np.unique(divisions.codes),
-            divisions.categories, divisions.ordered)
+                                         divisions.categories,
+                                         divisions.ordered)
     if isinstance(divisions, (tuple, list, Iterator)):
         return tuple(toolz.unique(divisions))
     raise NotImplementedError()
@@ -121,12 +132,39 @@ def insert_meta_param_description(*args, **kwargs):
         return lambda f: insert_meta_param_description(f, **kwargs)
     f = args[0]
     if f.__doc__:
-        indent = " "*kwargs.get('pad', 8)
+        indent = " " * kwargs.get('pad', 8)
         body = textwrap.wrap(_META_DESCRIPTION, initial_indent=indent,
                              subsequent_indent=indent, width=78)
         descr = '{0}\n{1}'.format(_META_TYPES, '\n'.join(body))
         f.__doc__ = f.__doc__.replace('$META', descr)
     return f
+
+
+@contextmanager
+def raise_on_meta_error(funcname=None):
+    """Reraise errors in this block to show metadata inference failure.
+
+    Parameters
+    ----------
+    funcname : str, optional
+        If provided, will be added to the error message to indicate the
+        name of the method that failed.
+    """
+    try:
+        yield
+    except Exception as e:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        tb = ''.join(traceback.format_tb(exc_traceback))
+        msg = ("Metadata inference failed{0}.\n\n"
+               "Original error is below:\n"
+               "------------------------\n"
+               "{1}\n\n"
+               "Traceback:\n"
+               "---------\n"
+               "{2}"
+               ).format(" in `{0}`".format(funcname) if funcname else "",
+                        repr(e), tb)
+        raise ValueError(msg)
 
 
 def make_meta(x, index=None):
@@ -236,6 +274,7 @@ _simple_fake_mapping = {
     'O': 'foo'
 }
 
+
 def _scalar_from_dtype(dtype):
     if dtype.kind in ('i', 'f', 'u'):
         return dtype.type(1)
@@ -266,6 +305,7 @@ def is_pd_scalar(x):
 
 
 def _nonempty_series(s, idx):
+
     dtype = s.dtype
     if is_datetime64tz_dtype(dtype):
         entry = pd.Timestamp('1970-01-01', tz=dtype.tz)
@@ -273,11 +313,12 @@ def _nonempty_series(s, idx):
     elif is_categorical_dtype(dtype):
         entry = s.cat.categories[0]
         data = pd.Categorical([entry, entry],
-                               categories=s.cat.categories,
-                               ordered=s.cat.ordered)
+                              categories=s.cat.categories,
+                              ordered=s.cat.ordered)
     else:
         entry = _scalar_from_dtype(dtype)
         data = np.array([entry, entry], dtype=dtype)
+
     return pd.Series(data, name=s.name, index=idx)
 
 
@@ -294,8 +335,12 @@ def meta_nonempty(x):
         return _nonempty_series(x, idx)
     elif isinstance(x, pd.DataFrame):
         idx = _nonempty_index(x.index)
-        data = {c: _nonempty_series(x[c], idx) for c in x.columns}
-        return pd.DataFrame(data, columns=x.columns, index=idx)
+        data = {i: _nonempty_series(x.iloc[:, i], idx)
+                for i, c in enumerate(x.columns)}
+        res = pd.DataFrame(data, index=idx,
+                           columns=np.arange(len(x.columns)))
+        res.columns = x.columns
+        return res
     elif is_pd_scalar(x):
         return _nonempty_scalar(x)
     else:
@@ -367,8 +412,8 @@ def _maybe_sort(a):
     return a.sort_index()
 
 
-def eq(a, b, check_names=True, check_dtypes=True, check_divisions=True,
-       **kwargs):
+def assert_eq(a, b, check_names=True, check_dtypes=True,
+              check_divisions=True, check_index=True, **kwargs):
     if check_divisions:
         assert_divisions(a)
         assert_divisions(b)
@@ -376,6 +421,9 @@ def eq(a, b, check_names=True, check_dtypes=True, check_divisions=True,
     assert_sane_keynames(b)
     a = _check_dask(a, check_names=check_names, check_dtypes=check_dtypes)
     b = _check_dask(b, check_names=check_names, check_dtypes=check_dtypes)
+    if not check_index:
+        a = a.reset_index(drop=True)
+        b = b.reset_index(drop=True)
     if isinstance(a, pd.DataFrame):
         a = _maybe_sort(a)
         b = _maybe_sort(b)
@@ -395,6 +443,11 @@ def eq(a, b, check_names=True, check_dtypes=True, check_divisions=True,
             else:
                 assert np.allclose(a, b)
     return True
+
+
+def eq(*args, **kwargs):
+    warnings.warn('eq is deprecated. Use assert_frame instead', UserWarning)
+    assert_eq(*args, **kwargs)
 
 
 def assert_dask_graph(dask, label):
@@ -419,15 +472,17 @@ def assert_divisions(ddf):
     if not ddf.known_divisions:
         return
 
+    index = lambda x: x if isinstance(x, pd.Index) else x.index
+
     results = get_sync(ddf.dask, ddf._keys())
     for i, df in enumerate(results[:-1]):
         if len(df):
-            assert df.index.min() >= ddf.divisions[i]
-            assert df.index.max() < ddf.divisions[i + 1]
+            assert index(df).min() >= ddf.divisions[i]
+            assert index(df).max() < ddf.divisions[i + 1]
 
     if len(results[-1]):
-        assert results[-1].index.min() >= ddf.divisions[-2]
-        assert results[-1].index.max() <= ddf.divisions[-1]
+        assert index(results[-1]).min() >= ddf.divisions[-2]
+        assert index(results[-1]).max() <= ddf.divisions[-1]
 
 
 def assert_sane_keynames(ddf):
@@ -473,3 +528,11 @@ def assert_dask_dtypes(ddf, res, numeric_equal=True):
             assert (a.kind in eq_types and b.kind in eq_types) or (a == b)
         else:
             assert type(ddf._meta) == type(res)
+
+
+def assert_max_deps(x, n, eq=True):
+    dependencies, dependents = get_deps(x.dask)
+    if eq:
+        assert max(map(len, dependencies.values())) == n
+    else:
+        assert max(map(len, dependencies.values())) <= n

@@ -36,16 +36,16 @@ def reduction(x, chunk, aggregate, axis=None, keepdims=None, dtype=None,
 
     # Map chunk across all blocks
     inds = tuple(range(x.ndim))
-    tmp = atop(partial(chunk, axis=axis, keepdims=True), inds, x, inds)
-    tmp._chunks = tuple((1,)*len(c) if i in axis else c for (i, c)
+    tmp = atop(chunk, inds, x, inds, axis=axis, keepdims=True)
+    tmp._chunks = tuple((1, ) * len(c) if i in axis else c for (i, c)
                         in enumerate(tmp.chunks))
 
     return _tree_reduce(tmp, aggregate, axis, keepdims, dtype, split_every,
-                       combine, name=name)
+                        combine, name=name)
 
 
 def _tree_reduce(x, aggregate, axis, keepdims, dtype, split_every=None,
-                combine=None, name=None):
+                 combine=None, name=None):
     """Perform the tree reduction step of a reduction.
 
     Lower level, users should use ``reduction`` or ``arg_reduction`` directly.
@@ -55,7 +55,7 @@ def _tree_reduce(x, aggregate, axis, keepdims, dtype, split_every=None,
     if isinstance(split_every, dict):
         split_every = dict((k, split_every.get(k, 2)) for k in axis)
     elif isinstance(split_every, int):
-        n = builtins.max(int(split_every ** (1/(len(axis) or 1))), 2)
+        n = builtins.max(int(split_every ** (1 / (len(axis) or 1))), 2)
         split_every = dict.fromkeys(axis, n)
     else:
         split_every = dict((k, v) for (k, v) in enumerate(x.numblocks) if k in axis)
@@ -95,7 +95,7 @@ def partial_reduce(func, x, split_every, keepdims=False, dtype=None, name=None):
     >>> partial_reduce(np.min, x, {0: 1, 2: 3})    # doctest: +SKIP
     """
     name = (name or funcname(func)) + '-' + tokenize(func, x, split_every,
-                                                   keepdims, dtype)
+                                                     keepdims, dtype)
     parts = [list(partition_all(split_every.get(i, 1), range(n))) for (i, n)
              in enumerate(x.numblocks)]
     keys = product(*map(range, map(len, parts)))
@@ -187,11 +187,9 @@ with ignoring(AttributeError):
         return reduction(a, chunk.nanprod, chunk.prod, axis=axis,
                          keepdims=keepdims, dtype=dt, split_every=split_every)
 
-
     @wraps(chunk.nancumsum)
     def nancumsum(x, axis, dtype=None):
         return cumreduction(chunk.nancumsum, operator.add, 0, x, axis, dtype)
-
 
     @wraps(chunk.nancumprod)
     def nancumprod(x, axis, dtype=None):
@@ -224,7 +222,7 @@ def mean_chunk(x, sum=chunk.sum, numel=numel, dtype='f8', **kwargs):
     n = numel(x, dtype=dtype, **kwargs)
     total = sum(x, dtype=dtype, **kwargs)
     result = np.empty(shape=n.shape,
-              dtype=[('total', total.dtype), ('n', n.dtype)])
+                      dtype=[('total', total.dtype), ('n', n.dtype)])
     result['n'] = n
     result['total'] = total
     return result
@@ -275,13 +273,13 @@ with ignoring(AttributeError):
 def moment_chunk(A, order=2, sum=chunk.sum, numel=numel, dtype='f8', **kwargs):
     total = sum(A, dtype=dtype, **kwargs)
     n = numel(A, **kwargs)
-    u = total/n
+    u = total / n
     M = np.empty(shape=n.shape + (order - 1,), dtype=dtype)
     for i in range(2, order + 1):
         M[..., i - 2] = sum((A - u)**i, dtype=dtype, **kwargs)
     result = np.empty(shape=n.shape, dtype=[('total', total.dtype),
                                             ('n', n.dtype),
-                                            ('M', M.dtype, (order-1,))])
+                                            ('M', M.dtype, (order - 1,))])
     result['total'] = total
     result['n'] = n
     result['M'] = M
@@ -289,9 +287,9 @@ def moment_chunk(A, order=2, sum=chunk.sum, numel=numel, dtype='f8', **kwargs):
 
 
 def _moment_helper(Ms, ns, inner_term, order, sum, kwargs):
-    M = Ms[..., order - 2].sum(**kwargs) + sum(ns * inner_term**order, **kwargs)
+    M = Ms[..., order - 2].sum(**kwargs) + sum(ns * inner_term ** order, **kwargs)
     for k in range(1, order - 1):
-        coeff = factorial(order)/(factorial(k)*factorial(order - k))
+        coeff = factorial(order) / (factorial(k) * factorial(order - k))
         M += coeff * sum(Ms[..., order - k - 2] * inner_term**k, **kwargs)
     return M
 
@@ -314,7 +312,7 @@ def moment_combine(data, order=2, ddof=0, dtype='f8', sum=np.sum, **kwargs):
 
     result = np.zeros(shape=n.shape, dtype=[('total', total.dtype),
                                             ('n', n.dtype),
-                                            ('M', Ms.dtype, (order-1,))])
+                                            ('M', Ms.dtype, (order - 1,))])
     result['total'] = total
     result['n'] = n
     result['M'] = M
@@ -350,8 +348,9 @@ def moment(a, order, axis=None, dtype=None, keepdims=False, ddof=0,
         dt = np.var(np.ones(shape=(1,), dtype=a._dtype)).dtype
     else:
         dt = None
-    return reduction(a, partial(moment_chunk, order=order), partial(moment_agg,
-                     order=order, ddof=ddof), axis=axis, keepdims=keepdims,
+    return reduction(a, partial(moment_chunk, order=order),
+                     partial(moment_agg, order=order, ddof=ddof),
+                     axis=axis, keepdims=keepdims,
                      dtype=dt, split_every=split_every,
                      combine=partial(moment_combine, order=order))
 
@@ -381,8 +380,10 @@ def nanvar(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None):
                      keepdims=keepdims, dtype=dt, split_every=split_every,
                      combine=partial(moment_combine, sum=np.nansum))
 
+
 with ignoring(AttributeError):
     nanvar = wraps(chunk.nanvar)(nanvar)
+
 
 @wraps(chunk.std)
 def std(a, axis=None, dtype=None, keepdims=False, ddof=0, split_every=None):
@@ -419,11 +420,11 @@ def vnorm(a, ord=None, axis=None, dtype=None, keepdims=False, split_every=None):
         return sum(abs(a), axis=axis, dtype=dtype, keepdims=keepdims,
                    split_every=split_every)
     elif ord % 2 == 0:
-        return sum(a**ord, axis=axis, dtype=dtype, keepdims=keepdims,
-                   split_every=split_every)**(1./ord)
+        return sum(a ** ord, axis=axis, dtype=dtype, keepdims=keepdims,
+                   split_every=split_every) ** (1. / ord)
     else:
-        return sum(abs(a)**ord, axis=axis, dtype=dtype, keepdims=keepdims,
-                   split_every=split_every)**(1./ord)
+        return sum(abs(a) ** ord, axis=axis, dtype=dtype, keepdims=keepdims,
+                   split_every=split_every) ** (1. / ord)
 
 
 def _arg_combine(data, axis, argfunc, keepdims=False):
@@ -526,7 +527,7 @@ def arg_reduction(x, chunk, combine, agg, axis=None, split_every=None):
     else:
         offset_info = pluck(axis[0], offsets)
 
-    chunks = tuple((1,)*len(c) if i in axis else c for (i, c)
+    chunks = tuple((1, ) * len(c) if i in axis else c for (i, c)
                    in enumerate(x.chunks))
     dsk = dict(((name,) + k, (chunk, (old,) + k, axis, off)) for (k, off)
                in zip(keys, offset_info))
@@ -550,9 +551,11 @@ def make_arg_reduction(func, argfunc, is_nan_func=False):
         agg = partial(nanarg_agg, func, argfunc)
     else:
         agg = partial(arg_agg, func, argfunc)
+
     @wraps(argfunc)
     def _(x, axis=None, split_every=None):
         return arg_reduction(x, chunk, combine, agg, axis, split_every)
+
     return _
 
 

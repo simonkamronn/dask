@@ -1,7 +1,9 @@
 import numpy as np
 import pandas as pd
+import pandas.util.testing as tm
 import dask.dataframe as dd
-from dask.dataframe.utils import shard_df_on_index, meta_nonempty, make_meta
+from dask.dataframe.utils import (shard_df_on_index, meta_nonempty, make_meta,
+                                  raise_on_meta_error)
 
 import pytest
 
@@ -126,6 +128,17 @@ def test_meta_nonempty():
     assert (df3['A'] == s).all()
 
 
+def test_meta_duplicated():
+    df = pd.DataFrame(columns=['A', 'A', 'B'])
+    res = meta_nonempty(df)
+
+    exp = pd.DataFrame([['foo', 'foo', 'foo'],
+                        ['foo', 'foo', 'foo']],
+                       index=['a', 'b'],
+                       columns=['A', 'A', 'B'])
+    tm.assert_frame_equal(res, exp)
+
+
 def test_meta_nonempty_index():
     idx = pd.RangeIndex(1, name='foo')
     res = meta_nonempty(idx)
@@ -187,3 +200,19 @@ def test_meta_nonempty_scalar():
     x = pd.Timestamp(2000, 1, 1)
     meta = meta_nonempty(x)
     assert meta is x
+
+
+def test_raise_on_meta_error():
+    try:
+        with raise_on_meta_error():
+            raise RuntimeError("Bad stuff")
+    except Exception as e:
+        assert e.args[0].startswith("Metadata inference failed.\n")
+        assert 'RuntimeError' in e.args[0]
+
+    try:
+        with raise_on_meta_error("myfunc"):
+            raise RuntimeError("Bad stuff")
+    except Exception as e:
+        assert e.args[0].startswith("Metadata inference failed in `myfunc`.\n")
+        assert 'RuntimeError' in e.args[0]

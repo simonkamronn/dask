@@ -5,6 +5,10 @@ def inc(x):
     return x + 1
 
 
+def dec(x):
+    return x - 1
+
+
 def add(x, y):
     return x + y
 
@@ -103,7 +107,7 @@ class GetFunctionTestMixin(object):
         assert self.get(d, 'z') == 4
 
     def test_get_stack_limit(self):
-        d = dict(('x%d' % (i+1), (inc, 'x%d' % i)) for i in range(10000))
+        d = dict(('x%d' % (i + 1), (inc, 'x%d' % i)) for i in range(10000))
         d['x0'] = 0
         assert self.get(d, 'x10000') == 10000
         # introduce cycle

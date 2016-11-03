@@ -12,13 +12,14 @@ Array
    examples/array-numpy.rst
    examples/array-hdf5.rst
    examples/array-random.rst
+   examples/array-extend.rst
 
 *  `Use Dask.array to generate task graphs <https://gist.github.com/mrocklin/b61f795004ec0a70e43de350e453e97e>`_
 
 Bag
 ---
 
-:doc:`Bag documentation<array>`
+:doc:`Bag documentation<bag>`
 
 .. toctree::
    :maxdepth: 1
@@ -29,7 +30,7 @@ Bag
 DataFrame
 ----------
 
-:doc:`DataFrame documentation<array>`
+:doc:`DataFrame documentation<dataframe>`
 
 .. toctree::
    :maxdepth: 1
@@ -46,7 +47,7 @@ DataFrame
 Delayed
 -------
 
-:doc:`Delayed documentation<array>`
+:doc:`Delayed documentation<delayed>`
 
 .. toctree::
    :maxdepth: 1
@@ -61,7 +62,7 @@ Delayed
 Distributed Concurrent.futures
 ------------------------------
 
-`Concurrent.futures documentation <http://distributed.readthedocs.io/en/latest/quickstart.html#map-and-submit-functions>`_
+`Concurrent.futures documentation <https://distributed.readthedocs.io/en/latest/quickstart.html#map-and-submit-functions>`_
 
 *  `Custom workflows <https://gist.github.com/mrocklin/ef9ccd29a6ec5f4de84d6192be95042a>`_
 *  `Ad Hoc Distributed Random Forests <https://gist.github.com/mrocklin/9f5720d8658e5f2f66666815b1f03f00>`_

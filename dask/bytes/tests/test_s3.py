@@ -81,15 +81,16 @@ def test_write_bytes(s3):
     values = [delayed(v) for v in files.values()]
     out = core.write_bytes(values, paths, s3=s3)
     compute(*out)
-    sample, values = read_bytes(test_bucket_name+'/more/test/accounts.*', s3=s3)
+    sample, values = read_bytes(test_bucket_name + '/more/test/accounts.*', s3=s3)
     results = compute(*concat(values))
     assert set(list(files.values())) == set(results)
 
 
 def test_read_bytes(s3):
-    sample, values = read_bytes(test_bucket_name+'/test/accounts.*', s3=s3)
+    sample, values = read_bytes(test_bucket_name + '/test/accounts.*', s3=s3)
     assert isinstance(sample, bytes)
     assert sample[:5] == files[sorted(files)[0]][:5]
+    assert sample.endswith(b'\n')
 
     assert isinstance(values, (list, tuple))
     assert isinstance(values[0], (list, tuple))
@@ -99,12 +100,26 @@ def test_read_bytes(s3):
     results = compute(*concat(values))
     assert set(results) == set(files.values())
 
+
+def test_read_bytes_sample_delimiter(s3):
+    sample, values = read_bytes(test_bucket_name + '/test/accounts.*', s3=s3,
+                                sample=80, delimiter=b'\n')
+    assert sample.endswith(b'\n')
+    sample, values = read_bytes(test_bucket_name + '/test/accounts.1.json', s3=s3,
+                                sample=80, delimiter=b'\n')
+    assert sample.endswith(b'\n')
+    sample, values = read_bytes(test_bucket_name + '/test/accounts.1.json', s3=s3,
+                                sample=2, delimiter=b'\n')
+    assert sample.endswith(b'\n')
+
+
 def test_read_bytes_non_existing_glob(s3):
     with pytest.raises(IOError):
-        read_bytes(test_bucket_name+'/non-existing/*', s3=s3)
+        read_bytes(test_bucket_name + '/non-existing/*', s3=s3)
+
 
 def test_read_bytes_blocksize_none(s3):
-    _, values = read_bytes(test_bucket_name+'/test/accounts.*', blocksize=None,
+    _, values = read_bytes(test_bucket_name + '/test/accounts.*', blocksize=None,
                            s3=s3)
     assert sum(map(len, values)) == len(files)
 
@@ -121,7 +136,7 @@ def test_read_bytes_blocksize_on_large_data():
 
 @pytest.mark.parametrize('blocksize', [5, 15, 45, 1500])
 def test_read_bytes_block(s3, blocksize):
-    _, vals = read_bytes(test_bucket_name+'/test/account*',
+    _, vals = read_bytes(test_bucket_name + '/test/account*',
                          blocksize=blocksize, s3=s3)
     assert (list(map(len, vals)) ==
             [(len(v) // blocksize + 1) for v in files.values()])
@@ -137,9 +152,9 @@ def test_read_bytes_block(s3, blocksize):
 
 @pytest.mark.parametrize('blocksize', [5, 15, 45, 1500])
 def test_read_bytes_delimited(s3, blocksize):
-    _, values = read_bytes(test_bucket_name+'/test/accounts*',
+    _, values = read_bytes(test_bucket_name + '/test/accounts*',
                            blocksize=blocksize, delimiter=b'\n', s3=s3)
-    _, values2 = read_bytes(test_bucket_name+'/test/accounts*',
+    _, values2 = read_bytes(test_bucket_name + '/test/accounts*',
                             blocksize=blocksize, delimiter=b'foo', s3=s3)
     assert ([a.key for a in concat(values)] !=
             [b.key for b in concat(values2)])
@@ -153,7 +168,7 @@ def test_read_bytes_delimited(s3, blocksize):
 
     # delimiter not at the end
     d = b'}'
-    _, values = read_bytes(test_bucket_name+'/test/accounts*',
+    _, values = read_bytes(test_bucket_name + '/test/accounts*',
                            blocksize=blocksize, delimiter=d,
                            s3=s3)
     results = compute(*concat(values))
@@ -168,9 +183,8 @@ def test_read_bytes_delimited(s3, blocksize):
 def test_registered(s3):
     from dask.bytes.core import read_bytes
 
-    sample, values = read_bytes(
-            's3://%s/test/accounts.*.json' % test_bucket_name,
-            s3=s3)
+    sample, values = read_bytes('s3://%s/test/accounts.*.json' % test_bucket_name,
+                                s3=s3)
 
     results = compute(*concat(values))
     assert set(results) == set(files.values())
@@ -187,9 +201,8 @@ def test_registered_open_files(s3):
 
 def test_registered_open_text_files(s3):
     from dask.bytes.core import open_text_files
-    myfiles = open_text_files(
-            's3://%s/test/accounts.*.json' % test_bucket_name,
-            s3=s3)
+    myfiles = open_text_files('s3://%s/test/accounts.*.json' % test_bucket_name,
+                              s3=s3)
     assert len(myfiles) == len(files)
     data = compute(*[file.read() for file in myfiles])
     assert list(data) == [files[k].decode() for k in sorted(files)]
@@ -198,19 +211,21 @@ def test_registered_open_text_files(s3):
 from dask.bytes.compression import compress, files as cfiles, seekable_files
 fmt_bs = [(fmt, None) for fmt in cfiles] + [(fmt, 10) for fmt in seekable_files]
 
+
 @pytest.mark.parametrize('fmt,blocksize', fmt_bs)
 def test_compression(s3, fmt, blocksize):
     with s3_context('compress', valmap(compress[fmt], files)) as s3:
         sample, values = read_bytes('compress/test/accounts.*', s3=s3,
                                     compression=fmt, blocksize=blocksize)
         assert sample.startswith(files[sorted(files)[0]][:10])
+        assert sample.endswith(b'\n')
 
         results = compute(*concat(values))
         assert b''.join(results) == b''.join([files[k] for k in sorted(files)])
 
 
 def test_files(s3):
-    myfiles = open_files(test_bucket_name+'/test/accounts.*', s3=s3)
+    myfiles = open_files(test_bucket_name + '/test/accounts.*', s3=s3)
     assert len(myfiles) == len(files)
     data = compute(*[file.read() for file in myfiles])
     assert list(data) == [files[k] for k in sorted(files)]

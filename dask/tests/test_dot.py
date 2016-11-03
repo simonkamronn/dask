@@ -16,8 +16,11 @@ else:
 from dask.utils import ensure_not_exists
 from IPython.display import Image, SVG
 
+
 # Since graphviz doesn't store a graph, we need to parse the output
 label_re = re.compile('.*\[label=(.*?) shape=.*\]')
+
+
 def get_label(line):
     m = label_re.match(line)
     if m:
@@ -70,9 +73,12 @@ def test_to_graphviz():
     assert set(labels).difference(dsk) == funcs
     assert set(labels).difference(funcs) == set(dsk)
 
+
 def test_to_graphviz_attributes():
     assert to_graphviz(dsk).graph_attr['rankdir'] == 'BT'
     assert to_graphviz(dsk, rankdir='LR').graph_attr['rankdir'] == 'LR'
+    assert to_graphviz(dsk, node_attr={'color': 'white'}).node_attr['color'] == 'white'
+    assert to_graphviz(dsk, edge_attr={'color': 'white'}).edge_attr['color'] == 'white'
 
 
 def test_aliases():

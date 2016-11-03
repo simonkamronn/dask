@@ -35,7 +35,7 @@ Dask emphasizes the following virtues:
    :align: center
 
 See the `dask.distributed documentation (separate website)
-<http://distributed.readthedocs.io/en/latest/>`_ for more technical information
+<https://distributed.readthedocs.io/en/latest/>`_ for more technical information
 on Dask's distributed scheduler,
 
 Familiar user interface
@@ -85,15 +85,15 @@ tasks:
 
 .. code-block:: python
 
-   from dask.distributed import Executor
-   e = Executor('scheduler:port')
+   from dask.distributed import Client
+   client = Client('scheduler:port')
 
    futures = []
    for fn in filenames:
-       future = e.submit(load, fn)
+       future = client.submit(load, fn)
        futures.append(future)
 
-   summary = e.submit(summarize, futures)
+   summary = client.submit(summarize, futures)
    summary.result()
 
 
@@ -173,10 +173,10 @@ Schedulers execute task graphs.  Dask currently has two main schedulers, one
 for single machine processing using threads or processes, and one for
 distributed memory clusters.
 
+* :doc:`distributed`
 * :doc:`scheduler-overview`
 * :doc:`scheduler-choice`
 * :doc:`Single machine scheduler<shared>`
-* `Distributed scheduler`_  (separate webpage)
 * :doc:`scheduling-policy`
 
 .. toctree::
@@ -184,6 +184,7 @@ distributed memory clusters.
    :hidden:
    :caption: Scheduling
 
+   distributed.rst
    scheduler-overview.rst
    scheduler-choice.rst
    shared.rst
@@ -230,8 +231,8 @@ often a better choice.  If you are a *core developer*, then you should start her
 
 **Help & reference**
 
-* :doc:`changelog`
 * :doc:`support`
+* :doc:`changelog`
 * :doc:`develop`
 * :doc:`faq`
 * :doc:`spark`
@@ -244,8 +245,8 @@ often a better choice.  If you are a *core developer*, then you should start her
    :hidden:
    :caption: Help & reference
 
-   changelog.rst
    support.rst
+   changelog.rst
    develop.rst
    faq.rst
    spark.rst
@@ -253,16 +254,8 @@ often a better choice.  If you are a *core developer*, then you should start her
    bytes.rst
    cite.rst
 
-**Contact**
-
-* For user questions please tag StackOverflow questions with the `#dask tag`_.
-* For bug reports and feature requests please use the `GitHub issue tracker`_
-* For community discussion please use `blaze-dev@continuum.io`_
-* For chat, see `gitter chat room`_
-
 Dask is part of the Blaze_ project supported and offered by
-`Continuum Analytics`_ and contributors under a `3-clause BSD
-license`_.
+`Continuum Analytics`_ and contributors under a `3-clause BSD license`_.
 
 .. _Blaze: http://continuum.io/open-source/blaze
 .. _`Continuum Analytics`: http://continuum.io
@@ -272,9 +265,8 @@ license`_.
 .. _`GitHub issue tracker`: https://github.com/dask/dask/issues
 .. _`blaze-dev@continuum.io`: https://groups.google.com/a/continuum.io/forum/#!forum/blaze-dev
 .. _`gitter chat room`: https://gitter.im/dask/dask
-.. _`xarray`: http://xray.readthedocs.org/en/stable/
+.. _`xarray`: https://xray.readthedocs.io/en/stable/
 .. _`scikit-image`: http://scikit-image.org/docs/stable/
 .. _`scikit-allel`: https://scikits.appspot.com/scikit-allel
 .. _`pandas`: http://pandas.pydata.org/pandas-docs/version/0.17.0/
-.. _`distributed scheduler`: http://distributed.readthedocs.org/en/latest/
-.. _`Distributed scheduler`: http://distributed.readthedocs.org/en/latest/
+.. _`distributed scheduler`: https://distributed.readthedocs.io/en/latest/

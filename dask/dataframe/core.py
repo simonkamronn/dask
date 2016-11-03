@@ -2,13 +2,14 @@ from __future__ import absolute_import, division, print_function
 
 from collections import Iterator
 from copy import copy
+from distutils.version import LooseVersion
 import operator
 from operator import getitem, setitem
 from pprint import pformat
 import uuid
 import warnings
 
-from toolz import merge, partial, first, unique
+from toolz import merge, partial, first, unique, partition_all
 import pandas as pd
 from pandas.util.decorators import cache_readonly
 import numpy as np
@@ -23,15 +24,14 @@ from .. import core
 from ..array.core import partial_by_order
 from .. import threaded
 from ..compatibility import apply, operator_div, bind_method
-from ..utils import (repr_long_list, IndexCallable,
-                     pseudorandom, derived_from, different_seeds, funcname,
-                     memory_repr, put_lines, M)
+from ..utils import (repr_long_list, random_state_data,
+                     pseudorandom, derived_from, funcname, memory_repr,
+                     put_lines, M)
 from ..base import Base, compute, tokenize, normalize_token
 from ..async import get_sync
 from . import methods
-from .indexing import (_partition_of_index_value, _loc, _try_loc,
-                       _coerce_loc_index, _maybe_partial_time_string)
-from .utils import meta_nonempty, make_meta, insert_meta_param_description
+from .utils import (meta_nonempty, make_meta, insert_meta_param_description,
+                    raise_on_meta_error)
 
 no_default = '__no_default__'
 
@@ -100,7 +100,11 @@ class Scalar(Base):
         # objects.
         self.dask = dsk
         self._name = name
-        self._meta = make_meta(meta)
+        meta = make_meta(meta)
+        if isinstance(meta, (pd.DataFrame, pd.Series, pd.Index)):
+            raise ValueError("Expected meta to specify scalar, got "
+                             "{0}".format(type(meta).__name__))
+        self._meta = meta
 
     @property
     def _meta_nonempty(self):
@@ -157,11 +161,7 @@ class Scalar(Base):
         def f(self):
             name = funcname(op) + '-' + tokenize(self)
             dsk = {(name, 0): (op, (self._name, 0))}
-            try:
-                meta = op(self._meta_nonempty)
-            except:
-                raise ValueError("Metadata inference failed in operator "
-                                 "{0}.".format(funcname(op)))
+            meta = op(self._meta_nonempty)
             return Scalar(merge(dsk, self.dask), name, meta)
         return f
 
@@ -189,16 +189,12 @@ def _scalar_binary(op, self, other, inv=False):
     else:
         dsk.update({(name, 0): (op, (self._name, 0), other_key)})
 
-    try:
-        other_meta = make_meta(other)
-        other_meta_nonempty = meta_nonempty(other_meta)
-        if inv:
-            meta = op(other_meta_nonempty, self._meta_nonempty)
-        else:
-            meta = op(self._meta_nonempty, other_meta_nonempty)
-    except:
-        raise ValueError("Metadata inference failed in operator "
-                         "{0}.".format(funcname(op)))
+    other_meta = make_meta(other)
+    other_meta_nonempty = meta_nonempty(other_meta)
+    if inv:
+        meta = op(other_meta_nonempty, self._meta_nonempty)
+    else:
+        meta = op(self._meta_nonempty, other_meta_nonempty)
 
     if return_type is not Scalar:
         return return_type(dsk, name, meta,
@@ -215,7 +211,7 @@ class _Frame(Base):
 
     dsk: dict
         The dask graph to compute this DataFrame
-    _name: str
+    name: str
         The key prefix that specifies which keys in the dask comprise this
         particular DataFrame / Series
     meta: pandas.DataFrame, pandas.Series, or pandas.Index
@@ -229,18 +225,20 @@ class _Frame(Base):
     _default_get = staticmethod(threaded.get)
     _finalize = staticmethod(finalize)
 
-    # constructor properties
-    # http://pandas.pydata.org/pandas-docs/stable/internals.html#override-constructor-properties
-
-    @property
-    def _constructor_sliced(self):
-        """Constructor used when a result has one lower dimension(s) as the original"""
-        raise NotImplementedError
+    def __init__(self, dsk, name, meta, divisions):
+        self.dask = dsk
+        self._name = name
+        meta = make_meta(meta)
+        if not isinstance(meta, self._partition_type):
+            raise ValueError("Expected meta to specify type {0}, got type "
+                             "{1}".format(self._partition_type.__name__,
+                                          type(meta).__name__))
+        self._meta = meta
+        self.divisions = tuple(divisions)
 
     @property
     def _constructor(self):
-        """Constructor used when a result has the same dimension(s) as the original"""
-        raise NotImplementedError
+        return new_dd_object
 
     @property
     def npartitions(self):
@@ -248,14 +246,9 @@ class _Frame(Base):
         return len(self.divisions) - 1
 
     @property
-    def _pd(self):
-        warnings.warn('Deprecation warning: use `_meta` instead')
-        return self._meta
-
-    @property
-    def _pd_nonempty(self):
-        warnings.warn('Deprecation warning: use `_meta_nonempty` instead')
-        return self._meta_nonempty
+    def size(self):
+        return self.reduction(methods.size, np.sum, token='size', meta=int,
+                              split_every=False)
 
     @property
     def _meta_nonempty(self):
@@ -295,6 +288,10 @@ class _Frame(Base):
         return Index(merge(dsk, self.dask), name,
                      self._meta.index, self.divisions)
 
+    @derived_from(pd.DataFrame)
+    def reset_index(self, drop=False):
+        return self.map_partitions(M.reset_index, drop=drop).clear_divisions()
+
     @property
     def known_divisions(self):
         """Whether divisions are already known"""
@@ -304,18 +301,14 @@ class _Frame(Base):
         divisions = (None,) * (self.npartitions + 1)
         return type(self)(self.dask, self._name, self._meta, divisions)
 
-    def get_division(self, n):
-        warnings.warn("Deprecation warning: use `get_partition` instead")
-        return self.get_partition(self, n)
-
     def get_partition(self, n):
         """Get a dask DataFrame/Series representing the `nth` partition."""
         if 0 <= n < self.npartitions:
             name = 'get-partition-%s-%s' % (str(n), self._name)
             dsk = {(name, 0): (self._name, n)}
-            divisions = self.divisions[n:n+2]
-            return self._constructor(merge(self.dask, dsk), name,
-                                     self._meta, divisions)
+            divisions = self.divisions[n:n + 2]
+            return new_dd_object(merge(self.dask, dsk), name,
+                                 self._meta, divisions)
         else:
             msg = "n must be 0 <= n < {0}".format(self.npartitions)
             raise ValueError(msg)
@@ -325,30 +318,36 @@ class _Frame(Base):
 
         Uses chest by default to store data on disk
         """
+        warnings.warn("Deprecation Warning: The `cache` method is deprecated, "
+                      "and will be removed in the next release. To achieve "
+                      "the same behavior, either write to disk or use "
+                      "`Client.persist`, from `dask.distributed`.")
         if callable(cache):
             cache = cache()
 
         # Evaluate and store in cache
         name = 'cache' + uuid.uuid1().hex
         dsk = dict(((name, i), (setitem, cache, (tuple, list(key)), key))
-                    for i, key in enumerate(self._keys()))
+                   for i, key in enumerate(self._keys()))
         self._get(merge(dsk, self.dask), list(dsk.keys()))
 
         # Create new dataFrame pointing to that cache
         name = 'from-cache-' + self._name
         dsk2 = dict(((name, i), (getitem, cache, (tuple, list(key))))
                     for i, key in enumerate(self._keys()))
-        return self._constructor(dsk2, name, self._meta, self.divisions)
+        return new_dd_object(dsk2, name, self._meta, self.divisions)
 
     @derived_from(pd.DataFrame)
     def drop_duplicates(self, **kwargs):
+        split_every = kwargs.pop('split_every', None)
         assert all(k in ('keep', 'subset', 'take_last') for k in kwargs)
         chunk = M.drop_duplicates
         return aca(self, chunk=chunk, aggregate=chunk, meta=self._meta,
-                   token='drop-duplicates', **kwargs)
+                   token='drop-duplicates', split_every=split_every, **kwargs)
 
     def __len__(self):
-        return self.reduction(len, np.sum, token='len', meta=int).compute()
+        return self.reduction(len, np.sum, token='len', meta=int,
+                              split_every=False).compute()
 
     @insert_meta_param_description(pad=12)
     def map_partitions(self, func, *args, **kwargs):
@@ -421,9 +420,9 @@ class _Frame(Base):
         return map_partitions(func, self, *args, **kwargs)
 
     @insert_meta_param_description(pad=12)
-    def reduction(self, chunk, aggregate=None, meta=no_default,
-                  token=None, chunk_kwargs=None, aggregate_kwargs=None,
-                  **kwargs):
+    def reduction(self, chunk, aggregate=None, combine=None, meta=no_default,
+                  token=None, split_every=None, chunk_kwargs=None,
+                  aggregate_kwargs=None, combine_kwargs=None, **kwargs):
         """Generic row-wise reductions.
 
         Parameters
@@ -433,7 +432,8 @@ class _Frame(Base):
             ``pandas.DataFrame``, ``pandas.Series``, or a scalar.
         aggregate : callable, optional
             Function to operate on the concatenated result of ``chunk``. If not
-            specified, defaults to ``chunk``.
+            specified, defaults to ``chunk``. Used to do the final aggregation
+            in a tree reduction.
 
             The input to ``aggregate`` depends on the output of ``chunk``.
             If the output of ``chunk`` is a:
@@ -445,16 +445,28 @@ class _Frame(Base):
 
             Should return a ``pandas.DataFrame``, ``pandas.Series``, or a
             scalar.
+        combine : callable, optional
+            Function to operate on intermediate concatenated results of
+            ``chunk`` in a tree-reduction. If not provided, defaults to
+            ``aggregate``. The input/output requirements should match that of
+            ``aggregate`` described above.
         $META
         token : str, optional
             The name to use for the output keys.
+        split_every : int, optional
+            Group partitions into groups of this size while performing a
+            tree-reduction. If set to False, no tree-reduction will be used,
+            and all intermediates will be concatenated and passed to
+            ``aggregate``. Default is 8.
         chunk_kwargs : dict, optional
             Keyword arguments to pass on to ``chunk`` only.
         aggregate_kwargs : dict, optional
             Keyword arguments to pass on to ``aggregate`` only.
+        combine_kwargs : dict, optional
+            Keyword arguments to pass on to ``combine`` only.
         kwargs :
-            All remaining keywords will be passed to both ``chunk`` and
-            ``aggregate``.
+            All remaining keywords will be passed to ``chunk``, ``combine``,
+            and ``aggregate``.
 
         Examples
         --------
@@ -510,23 +522,48 @@ class _Frame(Base):
         if aggregate is None:
             aggregate = chunk
 
+        if combine is None:
+            if combine_kwargs:
+                raise ValueError("`combine_kwargs` provided with no `combine`")
+            combine = aggregate
+            combine_kwargs = aggregate_kwargs
+
         chunk_kwargs = chunk_kwargs.copy() if chunk_kwargs else {}
         chunk_kwargs['aca_chunk'] = chunk
+
+        combine_kwargs = combine_kwargs.copy() if combine_kwargs else {}
+        combine_kwargs['aca_combine'] = combine
 
         aggregate_kwargs = aggregate_kwargs.copy() if aggregate_kwargs else {}
         aggregate_kwargs['aca_aggregate'] = aggregate
 
         return aca(self, chunk=_reduction_chunk, aggregate=_reduction_aggregate,
-                   meta=meta, token=token, chunk_kwargs=chunk_kwargs,
-                   aggregate_kwargs=aggregate_kwargs, **kwargs)
+                   combine=_reduction_combine, meta=meta, token=token,
+                   split_every=split_every, chunk_kwargs=chunk_kwargs,
+                   aggregate_kwargs=aggregate_kwargs,
+                   combine_kwargs=combine_kwargs, **kwargs)
 
-    def random_split(self, p, random_state=None):
+    @derived_from(pd.DataFrame)
+    def pipe(self, func, *args, **kwargs):
+        # Taken from pandas:
+        # https://github.com/pydata/pandas/blob/master/pandas/core/generic.py#L2698-L2707
+        if isinstance(func, tuple):
+            func, target = func
+            if target in kwargs:
+                raise ValueError('%s is both the pipe target and a keyword '
+                                 'argument' % target)
+            kwargs[target] = self
+            return func(*args, **kwargs)
+        else:
+            return func(self, *args, **kwargs)
+
+    def random_split(self, frac, random_state=None):
         """ Pseudorandomly split dataframe into different pieces row-wise
 
         Parameters
         ----------
-        frac : float, optional
-            Fraction of axis items to return.
+        frac : list
+            List of floats that should sum to one.
         random_state: int or np.random.RandomState
             If int create a new RandomState with this as the seed
         Otherwise draw from the passed RandomState
@@ -544,22 +581,24 @@ class _Frame(Base):
 
         See Also
         --------
-
-            dask.DataFrame.sample
+        dask.DataFrame.sample
         """
-        seeds = different_seeds(self.npartitions, random_state)
-        dsk_full = dict(((self._name + '-split-full', i),
-                         (pd_split, (self._name, i), p, seed))
-                       for i, seed in enumerate(seeds))
+        if not np.allclose(sum(frac), 1):
+            raise ValueError("frac should sum to 1")
+        state_data = random_state_data(self.npartitions, random_state)
+        token = tokenize(self, frac, random_state)
+        name = 'split-' + token
+        dsk = {(name, i): (pd_split, (self._name, i), frac, state)
+               for i, state in enumerate(state_data)}
 
-        dsks = [dict(((self._name + '-split-%d' % i, j),
-                      (getitem, (self._name + '-split-full', j), i))
-                      for j in range(self.npartitions))
-                      for i in range(len(p))]
-        return [type(self)(merge(self.dask, dsk_full, dsk),
-                           self._name + '-split-%d' % i,
-                           self._meta, self.divisions)
-                for i, dsk in enumerate(dsks)]
+        out = []
+        for i in range(len(frac)):
+            name2 = 'split-%d-%s' % (i, token)
+            dsk2 = {(name2, j): (getitem, (name, j), i)
+                    for j in range(self.npartitions)}
+            out.append(type(self)(merge(self.dask, dsk, dsk2), name2,
+                                  self._meta, self.divisions))
+        return out
 
     def head(self, n=5, npartitions=1, compute=True):
         """ First n rows of the dataset
@@ -579,8 +618,8 @@ class _Frame(Base):
         if npartitions <= -1:
             npartitions = self.npartitions
         if npartitions > self.npartitions:
-            raise ValueError("only {} partitions, head "
-                "received {}".format(self.npartitions, npartitions))
+            msg = "only {} partitions, head received {}"
+            raise ValueError(msg.format(self.npartitions, npartitions))
 
         name = 'head-%d-%d-%s' % (npartitions, n, self._name)
 
@@ -591,13 +630,13 @@ class _Frame(Base):
             for i in range(npartitions):
                 dsk[(name_p, i)] = (M.head, (self._name, i), n)
 
-            concat = (_concat, ([(name_p, i) for i in range(npartitions)]))
+            concat = (_concat, [(name_p, i) for i in range(npartitions)])
             dsk[(name, 0)] = (safe_head, concat, n)
         else:
             dsk = {(name, 0): (safe_head, (self._name, 0), n)}
 
-        result = self._constructor(merge(self.dask, dsk), name, self._meta,
-                                   [self.divisions[0], self.divisions[npartitions]])
+        result = new_dd_object(merge(self.dask, dsk), name, self._meta,
+                               [self.divisions[0], self.divisions[npartitions]])
 
         if compute:
             result = result.compute()
@@ -611,76 +650,12 @@ class _Frame(Base):
         name = 'tail-%d-%s' % (n, self._name)
         dsk = {(name, 0): (M.tail, (self._name, self.npartitions - 1), n)}
 
-        result = self._constructor(merge(self.dask, dsk), name,
-                                   self._meta, self.divisions[-2:])
+        result = new_dd_object(merge(self.dask, dsk), name,
+                               self._meta, self.divisions[-2:])
 
         if compute:
             result = result.compute()
         return result
-
-    def _loc(self, ind):
-        """ Helper function for the .loc accessor """
-        if isinstance(ind, Series):
-            return self._loc_series(ind)
-        if self.known_divisions:
-            ind = _maybe_partial_time_string(self._meta.index, ind, kind='loc')
-            if isinstance(ind, slice):
-                return self._loc_slice(ind)
-            else:
-                return self._loc_element(ind)
-        else:
-            return map_partitions(_try_loc, self, ind, meta=self)
-
-    def _loc_series(self, ind):
-        if not self.divisions == ind.divisions:
-            raise ValueError("Partitions of dataframe and index not the same")
-        return map_partitions(methods.loc, self, ind, token='loc-series',
-                              meta=self)
-
-    def _loc_element(self, ind):
-        name = 'loc-%s' % tokenize(ind, self)
-        part = _partition_of_index_value(self.divisions, ind)
-        if ind < self.divisions[0] or ind > self.divisions[-1]:
-            raise KeyError('the label [%s] is not in the index' % str(ind))
-        dsk = {(name, 0): (methods.loc, (self._name, part), slice(ind, ind))}
-
-        return self._constructor(merge(self.dask, dsk), name, self, [ind, ind])
-
-    def _loc_slice(self, ind):
-        name = 'loc-%s' % tokenize(ind, self)
-        assert ind.step in (None, 1)
-
-        if ind.start:
-            start = _partition_of_index_value(self.divisions, ind.start)
-        else:
-            start = 0
-        if ind.stop is not None:
-            stop = _partition_of_index_value(self.divisions, ind.stop)
-        else:
-            stop = self.npartitions - 1
-        istart = _coerce_loc_index(self.divisions, ind.start)
-        istop = _coerce_loc_index(self.divisions, ind.stop)
-        if stop == start:
-            dsk = {(name, 0): (_loc, (self._name, start), ind.start, ind.stop)}
-            divisions = [istart, istop]
-        else:
-            dsk = merge(
-              {(name, 0): (_loc, (self._name, start), ind.start, None)},
-              dict(((name, i), (self._name, start + i))
-                  for i in range(1, stop - start)),
-              {(name, stop - start): (_loc, (self._name, stop), None, ind.stop)})
-
-            divisions = ((max(istart, self.divisions[start])
-                          if ind.start is not None
-                          else self.divisions[0],) +
-                         self.divisions[start+1:stop+1] +
-                         (min(istop, self.divisions[stop+1])
-                          if ind.stop is not None
-                          else self.divisions[-1],))
-
-        assert len(divisions) == len(dsk) + 1
-        return self._constructor(merge(self.dask, dsk), name,
-                                 self._meta, divisions)
 
     @property
     def loc(self):
@@ -688,7 +663,8 @@ class _Frame(Base):
 
         >>> df.loc["b"]  # doctest: +SKIP
         >>> df.loc["b":"d"]  # doctest: +SKIP"""
-        return IndexCallable(self._loc)
+        from .indexing import _LocIndexer
+        return _LocIndexer(self)
 
     # NOTE: `iloc` is not implemented because of performance concerns.
     # see https://github.com/dask/dask/pull/507
@@ -751,21 +727,16 @@ class _Frame(Base):
         """
 
         if random_state is None:
-            random_state = np.random.randint(np.iinfo(np.int32).max)
+            random_state = np.random.RandomState()
 
         name = 'sample-' + tokenize(self, frac, replace, random_state)
-        func = M.sample
 
-        seeds = different_seeds(self.npartitions, random_state)
+        state_data = random_state_data(self.npartitions, random_state)
+        dsk = {(name, i): (methods.sample, (self._name, i), state, frac, replace)
+               for i, state in enumerate(state_data)}
 
-        dsk = dict(((name, i),
-                   (apply, func, (tuple, [(self._name, i)]),
-                       {'frac': frac, 'random_state': seed,
-                        'replace': replace}))
-                   for i, seed in zip(range(self.npartitions), seeds))
-
-        return self._constructor(merge(self.dask, dsk), name,
-                                 self._meta, self.divisions)
+        return new_dd_object(merge(self.dask, dsk), name,
+                             self._meta, self.divisions)
 
     def to_hdf(self, path_or_buf, key, mode='a', append=False, get=None, **kwargs):
         """ Export frame to hdf file(s)
@@ -1001,14 +972,10 @@ class _Frame(Base):
         from .io import to_csv
         return to_csv(self, filename, **kwargs)
 
-    def to_imperative(self):
-        warnings.warn("Deprecation warning: moved to to_delayed")
-        return self.to_delayed()
-
     def to_delayed(self):
-        """ Convert dataframe into dask Values
+        """ Convert dataframe into dask Delayed objects
 
-        Returns a list of values, one value per partition.
+        Returns a list of delayed values, one value per partition.
         """
         from ..delayed import Delayed
         return [Delayed(k, [self.dask]) for k in self._keys()]
@@ -1076,44 +1043,49 @@ class _Frame(Base):
         return Rolling(self, window=window, min_periods=min_periods,
                        freq=freq, center=center, win_type=win_type, axis=axis)
 
-    @derived_from(pd.DataFrame)
-    def sum(self, axis=None, skipna=True):
+    def _reduction_agg(self, name, axis=None, skipna=True,
+                       split_every=False):
         axis = self._validate_axis(axis)
-        meta = self._meta_nonempty.sum(axis=axis, skipna=skipna)
-        token = self._token_prefix + 'sum'
+
+        meta = getattr(self._meta_nonempty, name)(axis=axis, skipna=skipna)
+        token = self._token_prefix + name
+
+        method = getattr(M, name)
         if axis == 1:
-            return self.map_partitions(M.sum, meta=meta,
+            return self.map_partitions(method, meta=meta,
                                        token=token, skipna=skipna, axis=axis)
         else:
-            return self.reduction(M.sum, meta=meta, token=token,
-                                  skipna=skipna, axis=axis)
+            return self.reduction(method, meta=meta, token=token,
+                                  skipna=skipna, axis=axis,
+                                  split_every=split_every)
 
     @derived_from(pd.DataFrame)
-    def max(self, axis=None, skipna=True):
-        axis = self._validate_axis(axis)
-        meta = self._meta_nonempty.max(axis=axis, skipna=skipna)
-        token = self._token_prefix + 'max'
-        if axis == 1:
-            return self.map_partitions(M.max, meta=meta, token=token,
-                                       skipna=skipna, axis=axis)
-        else:
-            return self.reduction(M.max, meta=meta, token=token,
-                                  skipna=skipna, axis=axis)
+    def all(self, axis=None, skipna=True, split_every=False):
+        return self._reduction_agg('all', axis=axis, skipna=skipna,
+                                   split_every=split_every)
 
     @derived_from(pd.DataFrame)
-    def min(self, axis=None, skipna=True):
-        axis = self._validate_axis(axis)
-        meta = self._meta_nonempty.min(axis=axis, skipna=skipna)
-        token = self._token_prefix + 'min'
-        if axis == 1:
-            return self.map_partitions(M.min, meta=meta, token=token,
-                                       skipna=skipna, axis=axis)
-        else:
-            return self.reduction(M.min, meta=meta, token=token,
-                                  skipna=skipna, axis=axis)
+    def any(self, axis=None, skipna=True, split_every=False):
+        return self._reduction_agg('any', axis=axis, skipna=skipna,
+                                   split_every=split_every)
 
     @derived_from(pd.DataFrame)
-    def idxmax(self, axis=None, skipna=True):
+    def sum(self, axis=None, skipna=True, split_every=False):
+        return self._reduction_agg('sum', axis=axis, skipna=skipna,
+                                   split_every=split_every)
+
+    @derived_from(pd.DataFrame)
+    def max(self, axis=None, skipna=True, split_every=False):
+        return self._reduction_agg('max', axis=axis, skipna=skipna,
+                                   split_every=split_every)
+
+    @derived_from(pd.DataFrame)
+    def min(self, axis=None, skipna=True, split_every=False):
+        return self._reduction_agg('min', axis=axis, skipna=skipna,
+                                   split_every=split_every)
+
+    @derived_from(pd.DataFrame)
+    def idxmax(self, axis=None, skipna=True, split_every=False):
         fn = 'idxmax'
         axis = self._validate_axis(axis)
         meta = self._meta_nonempty.idxmax(axis=axis, skipna=skipna)
@@ -1122,12 +1094,15 @@ class _Frame(Base):
                                   token=self._token_prefix + fn,
                                   skipna=skipna, axis=axis)
         else:
+            scalar = not isinstance(meta, pd.Series)
             return aca([self], chunk=idxmaxmin_chunk, aggregate=idxmaxmin_agg,
-                        meta=meta, token=self._token_prefix + fn, skipna=skipna,
-                        known_divisions=self.known_divisions, fn=fn, axis=axis)
+                       combine=idxmaxmin_combine, meta=meta,
+                       aggregate_kwargs={'scalar': scalar},
+                       token=self._token_prefix + fn, split_every=split_every,
+                       skipna=skipna, fn=fn)
 
     @derived_from(pd.DataFrame)
-    def idxmin(self, axis=None, skipna=True):
+    def idxmin(self, axis=None, skipna=True, split_every=False):
         fn = 'idxmin'
         axis = self._validate_axis(axis)
         meta = self._meta_nonempty.idxmax(axis=axis)
@@ -1136,12 +1111,15 @@ class _Frame(Base):
                                   token=self._token_prefix + fn,
                                   skipna=skipna, axis=axis)
         else:
+            scalar = not isinstance(meta, pd.Series)
             return aca([self], chunk=idxmaxmin_chunk, aggregate=idxmaxmin_agg,
-                        meta=meta, token=self._token_prefix + fn, skipna=skipna,
-                        known_divisions=self.known_divisions, fn=fn, axis=axis)
+                       combine=idxmaxmin_combine, meta=meta,
+                       aggregate_kwargs={'scalar': scalar},
+                       token=self._token_prefix + fn, split_every=split_every,
+                       skipna=skipna, fn=fn)
 
     @derived_from(pd.DataFrame)
-    def count(self, axis=None):
+    def count(self, axis=None, split_every=False):
         axis = self._validate_axis(axis)
         token = self._token_prefix + 'count'
         if axis == 1:
@@ -1150,11 +1128,11 @@ class _Frame(Base):
                                        axis=axis)
         else:
             meta = self._meta_nonempty.count()
-            return self.reduction(M.count, meta=meta, token=token,
-                                  aggregate=M.sum)
+            return self.reduction(M.count, aggregate=M.sum, meta=meta,
+                                  token=token, split_every=split_every)
 
     @derived_from(pd.DataFrame)
-    def mean(self, axis=None, skipna=True):
+    def mean(self, axis=None, skipna=True, split_every=False):
         axis = self._validate_axis(axis)
         meta = self._meta_nonempty.mean(axis=axis, skipna=skipna)
         if axis == 1:
@@ -1163,14 +1141,14 @@ class _Frame(Base):
                                   axis=axis, skipna=skipna)
         else:
             num = self._get_numeric_data()
-            s = num.sum(skipna=skipna)
-            n = num.count()
+            s = num.sum(skipna=skipna, split_every=split_every)
+            n = num.count(split_every=split_every)
             name = self._token_prefix + 'mean-%s' % tokenize(self, axis, skipna)
             return map_partitions(methods.mean_aggregate, s, n,
                                   token=name, meta=meta)
 
     @derived_from(pd.DataFrame)
-    def var(self, axis=None, skipna=True, ddof=1):
+    def var(self, axis=None, skipna=True, ddof=1, split_every=False):
         axis = self._validate_axis(axis)
         meta = self._meta_nonempty.var(axis=axis, skipna=skipna)
         if axis == 1:
@@ -1179,15 +1157,15 @@ class _Frame(Base):
                                   axis=axis, skipna=skipna, ddof=ddof)
         else:
             num = self._get_numeric_data()
-            x = 1.0 * num.sum(skipna=skipna)
-            x2 = 1.0 * (num ** 2).sum(skipna=skipna)
-            n = num.count()
+            x = 1.0 * num.sum(skipna=skipna, split_every=split_every)
+            x2 = 1.0 * (num ** 2).sum(skipna=skipna, split_every=split_every)
+            n = num.count(split_every=split_every)
             name = self._token_prefix + 'var-%s' % tokenize(self, axis, skipna, ddof)
             return map_partitions(methods.var_aggregate, x2, x, n,
                                   token=name, meta=meta, ddof=ddof)
 
     @derived_from(pd.DataFrame)
-    def std(self, axis=None, skipna=True, ddof=1):
+    def std(self, axis=None, skipna=True, ddof=1, split_every=False):
         axis = self._validate_axis(axis)
         meta = self._meta_nonempty.std(axis=axis, skipna=skipna)
         if axis == 1:
@@ -1195,9 +1173,9 @@ class _Frame(Base):
                                   token=self._token_prefix + 'std',
                                   axis=axis, skipna=skipna, ddof=ddof)
         else:
-            v = self.var(skipna=skipna, ddof=ddof)
-            name = self._token_prefix + 'std-finish--%s' % tokenize(self, axis,
-                                                            skipna, ddof)
+            v = self.var(skipna=skipna, ddof=ddof, split_every=split_every)
+            token = tokenize(self, axis, skipna, ddof)
+            name = self._token_prefix + 'std-finish--%s' % token
             return map_partitions(np.sqrt, v, meta=meta, token=name)
 
     def quantile(self, q=0.5, axis=0):
@@ -1212,47 +1190,55 @@ class _Frame(Base):
             0 or 'index' for row-wise, 1 or 'columns' for column-wise
         """
         axis = self._validate_axis(axis)
-        name = 'quantiles-concat--' + tokenize(self, q, axis)
+        keyname = 'quantiles-concat--' + tokenize(self, q, axis)
 
         if axis == 1:
             if isinstance(q, list):
                 # Not supported, the result will have current index as columns
                 raise ValueError("'q' must be scalar when axis=1 is specified")
-            meta = pd.Series([], dtype='f8')
+            if LooseVersion(pd.__version__) >= '0.19':
+                name = q
+            else:
+                name = None
+            meta = pd.Series([], dtype='f8', name=name)
             return map_partitions(M.quantile, self, q, axis,
-                                  token=name, meta=meta)
+                                  token=keyname, meta=meta)
         else:
             meta = self._meta.quantile(q, axis=axis)
             num = self._get_numeric_data()
             quantiles = tuple(quantile(self[c], q) for c in num.columns)
 
             dask = {}
-            dask = merge(dask, *[q.dask for q in quantiles])
-            qnames = [(q._name, 0) for q in quantiles]
+            dask = merge(dask, *[_q.dask for _q in quantiles])
+            qnames = [(_q._name, 0) for _q in quantiles]
 
             if isinstance(quantiles[0], Scalar):
-                dask[(name, 0)] = (pd.Series, (list, qnames), num.columns)
+                dask[(keyname, 0)] = (pd.Series, qnames, num.columns)
                 divisions = (min(num.columns), max(num.columns))
-                return Series(dask, name, meta, divisions)
+                return Series(dask, keyname, meta, divisions)
             else:
                 from .multi import _pdconcat
-                dask[(name, 0)] = (_pdconcat, (list, qnames), 1)
-                return DataFrame(dask, name, meta, quantiles[0].divisions)
+                dask[(keyname, 0)] = (_pdconcat, qnames, 1)
+                return DataFrame(dask, keyname, meta, quantiles[0].divisions)
 
     @derived_from(pd.DataFrame)
-    def describe(self):
+    def describe(self, split_every=False):
         # currently, only numeric describe is supported
         num = self._get_numeric_data()
 
-        stats = [num.count(), num.mean(), num.std(), num.min(),
-                 num.quantile([0.25, 0.5, 0.75]), num.max()]
+        stats = [num.count(split_every=split_every),
+                 num.mean(split_every=split_every),
+                 num.std(split_every=split_every),
+                 num.min(split_every=split_every),
+                 num.quantile([0.25, 0.5, 0.75]),
+                 num.max(split_every=split_every)]
         stats_names = [(s._name, 0) for s in stats]
 
-        name = 'describe--' + tokenize(self)
+        name = 'describe--' + tokenize(self, split_every)
         dsk = merge(num.dask, *(s.dask for s in stats))
-        dsk[(name, 0)] = (methods.describe_aggregate,(list, stats_names))
+        dsk[(name, 0)] = (methods.describe_aggregate, stats_names)
 
-        return self._constructor(dsk, name, num._meta, divisions=[None, None])
+        return new_dd_object(dsk, name, num._meta, divisions=[None, None])
 
     def _cum_agg(self, token, chunk, aggregate, axis, skipna=True,
                  chunk_kwargs=None):
@@ -1289,8 +1275,8 @@ class _Frame(Base):
                     dask[(cname, i)] = (aggregate, (cname, i - 1),
                                         (cumlast._name, i - 1))
                 dask[(name, i)] = (aggregate, (cumpart._name, i), (cname, i))
-            return self._constructor(merge(dask, cumpart.dask, cumlast.dask),
-                                     name, chunk(self._meta), self.divisions)
+            return new_dd_object(merge(dask, cumpart.dask, cumlast.dask),
+                                 name, chunk(self._meta), self.divisions)
 
     @derived_from(pd.DataFrame)
     def cumsum(self, axis=None, skipna=True):
@@ -1375,10 +1361,42 @@ class _Frame(Base):
             divisions = [None] * (self.npartitions + other.npartitions + 1)
             return _append(self, other, divisions)
 
+    @derived_from(pd.DataFrame)
+    def align(self, other, join='outer', axis=None, fill_value=None):
+        meta1, meta2 = _emulate(M.align, self, other, join, axis=axis,
+                                fill_value=fill_value)
+        aligned = self.map_partitions(M.align, other, join=join, axis=axis,
+                                      fill_value=fill_value)
+
+        token = tokenize(self, other, join, axis, fill_value)
+
+        name1 = 'align1-' + token
+        dsk1 = dict(((name1, i), (getitem, key, 0))
+                    for i, key in enumerate(aligned._keys()))
+        dsk1.update(aligned.dask)
+        result1 = new_dd_object(dsk1, name1, meta1, aligned.divisions)
+
+        name2 = 'align2-' + token
+        dsk2 = dict(((name2, i), (getitem, key, 1))
+                    for i, key in enumerate(aligned._keys()))
+        dsk2.update(aligned.dask)
+        result2 = new_dd_object(dsk2, name2, meta2, aligned.divisions)
+
+        return result1, result2
+
+    @derived_from(pd.DataFrame)
+    def combine_first(self, other):
+        return self.map_partitions(M.combine_first, other)
+
     @classmethod
     def _bind_operator_method(cls, name, op):
         """ bind operator method like DataFrame.add to this class """
         raise NotImplementedError
+
+    @derived_from(pd.DataFrame)
+    def resample(self, rule, how=None, closed=None, label=None):
+        from .tseries.resample import _resample
+        return _resample(self, rule, how=how, closed=closed, label=label)
 
 
 normalize_token.register((Scalar, _Frame), lambda a: a._name)
@@ -1412,21 +1430,6 @@ class Series(_Frame):
     _partition_type = pd.Series
     _token_prefix = 'series-'
 
-    def __init__(self, dsk, _name, meta, divisions):
-        super(Series, self).__init__()
-        self.dask = dsk
-        self._name = _name
-        self._meta = make_meta(meta)
-        self.divisions = tuple(divisions)
-
-    @property
-    def _constructor_sliced(self):
-        return Scalar
-
-    @property
-    def _constructor(self):
-        return Series
-
     @property
     def name(self):
         return self._meta.name
@@ -1449,9 +1452,24 @@ class Series(_Frame):
         """ Return data type """
         return self._meta.dtype
 
-    @property
+    @cache_readonly
+    def dt(self):
+        from .accessor import DatetimeAccessor
+        return DatetimeAccessor(self)
+
+    @derived_from(pd.Series)
+    def reset_index(self, drop=False):
+        return super(Series, self).reset_index(drop=drop)
+
+    @cache_readonly
     def cat(self):
-        return self._meta.cat
+        from .accessor import CategoricalAccessor
+        return CategoricalAccessor(self)
+
+    @cache_readonly
+    def str(self):
+        from .accessor import StringAccessor
+        return StringAccessor(self)
 
     def __dir__(self):
         o = set(dir(type(self)))
@@ -1461,14 +1479,9 @@ class Series(_Frame):
         return list(o)
 
     @property
-    def column_info(self):
-        """ Return Series.name """
-        warnings.warn('column_info is deprecated, use name')
-        return self.name
-
-    @property
     def nbytes(self):
-        return self.reduction(methods.nbytes, np.sum, token='nbytes', meta=int)
+        return self.reduction(methods.nbytes, np.sum, token='nbytes',
+                              meta=int, split_every=False)
 
     def __array__(self, dtype=None, **kwargs):
         x = np.array(self.compute())
@@ -1479,13 +1492,15 @@ class Series(_Frame):
     def __array_wrap__(self, array, context=None):
         return pd.Series(array, name=self.name)
 
-    @cache_readonly
-    def dt(self):
-        return DatetimeAccessor(self)
+    @derived_from(pd.Series)
+    def round(self, decimals=0):
+        return elemwise(M.round, self, decimals)
 
-    @cache_readonly
-    def str(self):
-        return StringAccessor(self)
+    @derived_from(pd.DataFrame)
+    def to_timestamp(self, freq=None, how='start', axis=0):
+        df = elemwise(M.to_timestamp, self, freq, how, axis)
+        df.divisions = tuple(pd.Index(self.divisions).to_timestamp())
+        return df
 
     def quantile(self, q=0.5):
         """ Approximate quantiles of Series
@@ -1501,19 +1516,14 @@ class Series(_Frame):
         from .partitionquantiles import partition_quantiles
         return partition_quantiles(self, npartitions, upsample=upsample)
 
-    @derived_from(pd.Series)
-    def resample(self, rule, how=None, closed=None, label=None):
-        from .tseries.resample import _resample
-        return _resample(self, rule, how=how, closed=closed, label=label)
-
     def __getitem__(self, key):
         if isinstance(key, Series) and self.divisions == key.divisions:
             name = 'index-%s' % tokenize(self, key)
             dsk = dict(((name, i), (operator.getitem, (self._name, i),
-                                                       (key._name, i)))
-                        for i in range(self.npartitions))
+                                    (key._name, i)))
+                       for i in range(self.npartitions))
             return Series(merge(self.dask, key.dask, dsk), name,
-                          self.name, self.divisions)
+                          self._meta, self.divisions)
         raise NotImplementedError()
 
     @derived_from(pd.DataFrame)
@@ -1540,50 +1550,10 @@ class Series(_Frame):
         return SeriesGroupBy(self, index, **kwargs)
 
     @derived_from(pd.Series)
-    def sum(self, axis=None, skipna=True):
-        return super(Series, self).sum(axis=axis, skipna=skipna)
+    def count(self, split_every=False):
+        return super(Series, self).count(split_every=split_every)
 
-    @derived_from(pd.Series)
-    def max(self, axis=None, skipna=True):
-        return super(Series, self).max(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def min(self, axis=None, skipna=True):
-        return super(Series, self).min(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def count(self):
-        return super(Series, self).count()
-
-    @derived_from(pd.Series)
-    def mean(self, axis=None, skipna=True):
-        return super(Series, self).mean(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def var(self, axis=None, ddof=1, skipna=True):
-        return super(Series, self).var(axis=axis, ddof=ddof, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def std(self, axis=None, ddof=1, skipna=True):
-        return super(Series, self).std(axis=axis, ddof=ddof, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def cumsum(self, axis=None, skipna=True):
-        return super(Series, self).cumsum(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def cumprod(self, axis=None, skipna=True):
-        return super(Series, self).cumprod(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def cummax(self, axis=None, skipna=True):
-        return super(Series, self).cummax(axis=axis, skipna=skipna)
-
-    @derived_from(pd.Series)
-    def cummin(self, axis=None, skipna=True):
-        return super(Series, self).cummin(axis=axis, skipna=skipna)
-
-    def unique(self):
+    def unique(self, split_every=None):
         """
         Return Series of unique values in the object. Includes NA values.
 
@@ -1592,23 +1562,26 @@ class Series(_Frame):
         uniques : Series
         """
         return aca(self, chunk=methods.unique, aggregate=methods.unique,
-                   meta=self._meta, token='unique', series_name=self.name)
+                   meta=self._meta, token='unique', split_every=split_every,
+                   series_name=self.name)
 
     @derived_from(pd.Series)
-    def nunique(self):
-        return self.drop_duplicates().count()
+    def nunique(self, split_every=None):
+        return self.drop_duplicates(split_every=split_every).count()
 
     @derived_from(pd.Series)
-    def value_counts(self):
+    def value_counts(self, split_every=None):
         return aca(self, chunk=M.value_counts,
                    aggregate=methods.value_counts_aggregate,
-                   meta=self._meta.value_counts(), token='value-counts')
+                   combine=methods.value_counts_combine,
+                   meta=self._meta.value_counts(), token='value-counts',
+                   split_every=split_every)
 
     @derived_from(pd.Series)
-    def nlargest(self, n=5):
+    def nlargest(self, n=5, split_every=None):
         return aca(self, chunk=M.nlargest, aggregate=M.nlargest,
                    meta=self._meta, token='series-nlargest-n={0}'.format(n),
-                   n=n)
+                   split_every=split_every, n=n)
 
     @derived_from(pd.Series)
     def isin(self, other):
@@ -1624,11 +1597,7 @@ class Series(_Frame):
                    enumerate(self._keys()))
         dsk.update(self.dask)
         if meta is no_default:
-            try:
-                meta = self._meta_nonempty.map(arg, na_action=na_action)
-            except Exception:
-                raise ValueError("Metadata inference failed, please provide "
-                                "`meta` keyword")
+            meta = _emulate(M.map, self, arg, na_action=na_action)
         else:
             meta = make_meta(meta)
 
@@ -1646,6 +1615,23 @@ class Series(_Frame):
     @derived_from(pd.Series)
     def clip(self, lower=None, upper=None):
         return self.map_partitions(M.clip, lower=lower, upper=upper)
+
+    @derived_from(pd.Series)
+    def clip_lower(self, threshold):
+        return self.map_partitions(M.clip_lower, threshold=threshold)
+
+    @derived_from(pd.Series)
+    def clip_upper(self, threshold):
+        return self.map_partitions(M.clip_upper, threshold=threshold)
+
+    @derived_from(pd.Series)
+    def align(self, other, join='outer', axis=None, fill_value=None):
+        return super(Series, self).align(other, join=join, axis=axis,
+                                         fill_value=fill_value)
+
+    @derived_from(pd.Series)
+    def combine_first(self, other):
+        return self.map_partitions(M.combine_first, other)
 
     def to_bag(self, index=False):
         """Convert to a dask Bag.
@@ -1676,6 +1662,19 @@ class Series(_Frame):
             return map_partitions(op, self, other, meta=meta,
                                   axis=axis, fill_value=fill_value)
         meth.__doc__ = op.__doc__
+        bind_method(cls, name, meth)
+
+    @classmethod
+    def _bind_comparison_method(cls, name, comparison):
+        """ bind comparison method like DataFrame.add to this class """
+
+        def meth(self, other, level=None, axis=0):
+            if level is not None:
+                raise NotImplementedError('level must be None')
+            axis = self._validate_axis(axis)
+            return elemwise(comparison, self, other, axis=axis)
+
+        meth.__doc__ = comparison.__doc__
         bind_method(cls, name, meth)
 
     @insert_meta_param_description(pad=12)
@@ -1754,13 +1753,9 @@ class Series(_Frame):
                    "  or:     .apply(func, meta=('x', 'f8'))            for series result")
             warnings.warn(msg)
 
-            try:
-                meta = _emulate(M.apply, self._meta_nonempty, func,
-                                convert_dtype=convert_dtype,
-                                args=args, **kwds)
-            except Exception:
-                raise ValueError("Metadata inference failed, please provide "
-                                 "`meta` keyword")
+            meta = _emulate(M.apply, self._meta_nonempty, func,
+                            convert_dtype=convert_dtype,
+                            args=args, **kwds)
 
         return map_partitions(M.apply, self, func,
                               convert_dtype, args, meta=meta, **kwds)
@@ -1795,10 +1790,6 @@ class Index(Series):
         msg = "'{0}' object has no attribute 'index'"
         raise AttributeError(msg.format(self.__class__.__name__))
 
-    @property
-    def _constructor(self):
-        return Index
-
     def head(self, n=5, compute=True):
         """ First n items of the Index.
 
@@ -1807,29 +1798,29 @@ class Index(Series):
         name = 'head-%d-%s' % (n, self._name)
         dsk = {(name, 0): (operator.getitem, (self._name, 0), slice(0, n))}
 
-        result = self._constructor(merge(self.dask, dsk), name,
-                                   self._meta, self.divisions[:2])
+        result = new_dd_object(merge(self.dask, dsk), name,
+                               self._meta, self.divisions[:2])
 
         if compute:
             result = result.compute()
         return result
 
-    def nunique(self):
-        return self.drop_duplicates().count()
-
     @derived_from(pd.Index)
-    def max(self):
+    def max(self, split_every=False):
         return self.reduction(M.max, meta=self._meta_nonempty.max(),
-                              token=self._token_prefix + 'max')
+                              token=self._token_prefix + 'max',
+                              split_every=split_every)
 
     @derived_from(pd.Index)
-    def min(self):
+    def min(self, split_every=False):
         return self.reduction(M.min, meta=self._meta_nonempty.min(),
-                              token=self._token_prefix + 'min')
+                              token=self._token_prefix + 'min',
+                              split_every=split_every)
 
-    def count(self):
+    def count(self, split_every=False):
         return self.reduction(methods.index_count, np.sum,
-                              token='index-count', meta=int)
+                              token='index-count', meta=int,
+                              split_every=split_every)
 
 
 class DataFrame(_Frame):
@@ -1854,60 +1845,42 @@ class DataFrame(_Frame):
     _partition_type = pd.DataFrame
     _token_prefix = 'dataframe-'
 
-    def __init__(self, dsk, name, meta, divisions):
-        super(DataFrame, self).__init__()
-        self.dask = dsk
-        self._name = name
-        self._meta = make_meta(meta)
-        self.divisions = tuple(divisions)
-
-    @property
-    def _constructor_sliced(self):
-        return Series
-
-    @property
-    def _constructor(self):
-        return DataFrame
-
     @property
     def columns(self):
         return self._meta.columns
 
     @columns.setter
     def columns(self, columns):
-        # if length mismatches, error is raised from pandas
-        self._meta.columns = columns
         renamed = _rename_dask(self, columns)
-        # update myself
-        self.dask.update(renamed.dask)
+        self._meta = renamed._meta
         self._name = renamed._name
+        self.dask.update(renamed.dask)
 
     def __getitem__(self, key):
         name = 'getitem-%s' % tokenize(self, key)
-        if np.isscalar(key):
+        if np.isscalar(key) or isinstance(key, tuple):
 
             if isinstance(self._meta.index, (pd.DatetimeIndex, pd.PeriodIndex)):
                 if key not in self._meta.columns:
-                    return self._loc(key)
+                    return self.loc[key]
 
             # error is raised from pandas
             meta = self._meta[_extract_meta(key)]
             dsk = dict(((name, i), (operator.getitem, (self._name, i), key))
                        for i in range(self.npartitions))
-            return self._constructor_sliced(merge(self.dask, dsk), name,
-                                            meta, self.divisions)
+            return new_dd_object(merge(self.dask, dsk), name,
+                                 meta, self.divisions)
         elif isinstance(key, slice):
-            return self._loc(key)
+            return self.loc[key]
 
         if isinstance(key, list):
             # error is raised from pandas
             meta = self._meta[_extract_meta(key)]
 
-            dsk = dict(((name, i), (operator.getitem,
-                                    (self._name, i), (list, key)))
-                        for i in range(self.npartitions))
-            return self._constructor(merge(self.dask, dsk), name,
-                                     meta, self.divisions)
+            dsk = dict(((name, i), (operator.getitem, (self._name, i), key))
+                       for i in range(self.npartitions))
+            return new_dd_object(merge(self.dask, dsk), name,
+                                 meta, self.divisions)
         if isinstance(key, Series):
             # do not perform dummy calculation, as columns will not be changed.
             #
@@ -1916,8 +1889,8 @@ class DataFrame(_Frame):
                 self, key = _maybe_align_partitions([self, key])
             dsk = {(name, i): (M._getitem_array, (self._name, i), (key._name, i))
                    for i in range(self.npartitions)}
-            return self._constructor(merge(self.dask, key.dask, dsk), name,
-                                     self, self.divisions)
+            return new_dd_object(merge(self.dask, key.dask, dsk), name,
+                                 self, self.divisions)
         raise NotImplementedError(key)
 
     def __setitem__(self, key, value):
@@ -1931,14 +1904,25 @@ class DataFrame(_Frame):
         self._name = df._name
         self._meta = df._meta
 
+    def __setattr__(self, key, value):
+        try:
+            columns = object.__getattribute__(self, '_meta').columns
+        except AttributeError:
+            columns = ()
+
+        if key in columns:
+            self[key] = value
+        else:
+            object.__setattr__(self, key, value)
+
     def __getattr__(self, key):
         if key in self.columns:
             meta = self._meta[key]
             name = 'getitem-%s' % tokenize(self, key)
             dsk = dict(((name, i), (operator.getitem, (self._name, i), key))
                        for i in range(self.npartitions))
-            return self._constructor_sliced(merge(self.dask, dsk), name,
-                                            meta, self.divisions)
+            return new_dd_object(merge(self.dask, dsk), name,
+                                 meta, self.divisions)
         raise AttributeError("'DataFrame' object has no attribute %r" % key)
 
     def __dir__(self):
@@ -1958,6 +1942,19 @@ class DataFrame(_Frame):
     def dtypes(self):
         """ Return data types """
         return self._meta.dtypes
+
+    @derived_from(pd.DataFrame)
+    def get_dtype_counts(self):
+        return self._meta.get_dtype_counts()
+
+    @derived_from(pd.DataFrame)
+    def get_ftype_counts(self):
+        return self._meta.get_ftype_counts()
+
+    @derived_from(pd.DataFrame)
+    def select_dtypes(self, include=None, exclude=None):
+        cs = self._meta.select_dtypes(include=include, exclude=exclude).columns
+        return self[list(cs)]
 
     def set_index(self, other, drop=True, sorted=False, **kwargs):
         """ Set the DataFrame index (row labels) using an existing column
@@ -2000,23 +1997,12 @@ class DataFrame(_Frame):
         from .shuffle import set_partition
         return set_partition(self, column, divisions, **kwargs)
 
-    @property
-    def column_info(self):
-        """ Return DataFrame.columns """
-        warnings.warn('column_info is deprecated, use columns')
-        return self.columns
-
     @derived_from(pd.DataFrame)
-    def nlargest(self, n=5, columns=None):
+    def nlargest(self, n=5, columns=None, split_every=None):
         token = 'dataframe-nlargest-n={0}'.format(n)
         return aca(self, chunk=M.nlargest, aggregate=M.nlargest,
-                   meta=self._meta, token=token, n=n, columns=columns)
-
-    @derived_from(pd.DataFrame)
-    def reset_index(self):
-        out = self.map_partitions(M.reset_index)
-        out.divisions = [None] * (self.npartitions + 1)
-        return out
+                   meta=self._meta, token=token, split_every=split_every,
+                   n=n, columns=columns)
 
     @derived_from(pd.DataFrame)
     def groupby(self, key, **kwargs):
@@ -2096,20 +2082,38 @@ class DataFrame(_Frame):
                        for i in range(self.npartitions))
 
         meta = self._meta.query(expr, **kwargs)
-        return self._constructor(merge(dsk, self.dask), name,
-                                 meta, self.divisions)
+        return new_dd_object(merge(dsk, self.dask), name,
+                             meta, self.divisions)
 
     @derived_from(pd.DataFrame)
     def eval(self, expr, inplace=None, **kwargs):
         if '=' in expr and inplace in (True, None):
             raise NotImplementedError("Inplace eval not supported."
-            " Please use inplace=False")
+                                      " Please use inplace=False")
         meta = self._meta.eval(expr, inplace=inplace, **kwargs)
         return self.map_partitions(M.eval, expr, meta=meta, inplace=inplace, **kwargs)
 
     @derived_from(pd.DataFrame)
     def dropna(self, how='any', subset=None):
         return self.map_partitions(M.dropna, how=how, subset=subset)
+
+    @derived_from(pd.DataFrame)
+    def clip(self, lower=None, upper=None):
+        return self.map_partitions(M.clip, lower=lower, upper=upper)
+
+    @derived_from(pd.DataFrame)
+    def clip_lower(self, threshold):
+        return self.map_partitions(M.clip_lower, threshold=threshold)
+
+    @derived_from(pd.DataFrame)
+    def clip_upper(self, threshold):
+        return self.map_partitions(M.clip_upper, threshold=threshold)
+
+    @derived_from(pd.DataFrame)
+    def to_timestamp(self, freq=None, how='start', axis=0):
+        df = elemwise(M.to_timestamp, self, freq, how, axis)
+        df.divisions = tuple(pd.Index(self.divisions).to_timestamp())
+        return df
 
     def to_castra(self, fn=None, categories=None, sorted_index_column=None,
                   compute=True, get=get_sync):
@@ -2168,17 +2172,18 @@ class DataFrame(_Frame):
 
     @derived_from(pd.DataFrame)
     def merge(self, right, how='inner', on=None, left_on=None, right_on=None,
-              left_index=False, right_index=False,
-              suffixes=('_x', '_y'), npartitions=None, shuffle=None):
+              left_index=False, right_index=False, suffixes=('_x', '_y'),
+              indicator=False, npartitions=None, shuffle=None):
 
         if not isinstance(right, (DataFrame, pd.DataFrame)):
             raise ValueError('right must be DataFrame')
 
         from .multi import merge
-        return merge(self, right, how=how, on=on,
-                     left_on=left_on, right_on=right_on,
-                     left_index=left_index, right_index=right_index,
-                     suffixes=suffixes, npartitions=npartitions, shuffle=shuffle)
+        return merge(self, right, how=how, on=on, left_on=left_on,
+                     right_on=right_on, left_index=left_index,
+                     right_index=right_index, suffixes=suffixes,
+                     npartitions=npartitions, indicator=indicator,
+                     shuffle=shuffle)
 
     @derived_from(pd.DataFrame)
     def join(self, other, on=None, how='left',
@@ -2229,18 +2234,38 @@ class DataFrame(_Frame):
 
             axis = self._validate_axis(axis)
 
-            if axis == 1:
-                # when axis=1, series will be added to each row
-                # it not supported for dd.Series.
-                # dd.DataFrame is not affected as op is applied elemwise
+            if axis in (1, 'columns'):
+                # When axis=1 and other is a series, `other` is transposed
+                # and the operator is applied broadcast across rows. This
+                # isn't supported with dd.Series.
                 if isinstance(other, Series):
                     msg = 'Unable to {0} dd.Series with axis=1'.format(name)
                     raise ValueError(msg)
+                elif isinstance(other, pd.Series):
+                    # Special case for pd.Series to avoid unwanted partitioning
+                    # of other. We pass it in as a kwarg to prevent this.
+                    meta = _emulate(op, self, other=other, axis=axis,
+                                    fill_value=fill_value)
+                    return map_partitions(op, self, other=other, meta=meta,
+                                          axis=axis, fill_value=fill_value)
 
             meta = _emulate(op, self, other, axis=axis, fill_value=fill_value)
             return map_partitions(op, self, other, meta=meta,
                                   axis=axis, fill_value=fill_value)
         meth.__doc__ = op.__doc__
+        bind_method(cls, name, meth)
+
+    @classmethod
+    def _bind_comparison_method(cls, name, comparison):
+        """ bind comparison method like DataFrame.add to this class """
+
+        def meth(self, other, axis='columns', level=None):
+            if level is not None:
+                raise NotImplementedError('level must be None')
+            axis = self._validate_axis(axis)
+            return elemwise(comparison, self, other, axis=axis)
+
+        meth.__doc__ = comparison.__doc__
         bind_method(cls, name, meth)
 
     @insert_meta_param_description(pad=12)
@@ -2316,9 +2341,9 @@ class DataFrame(_Frame):
         axis = self._validate_axis(axis)
 
         if axis == 0:
-            raise NotImplementedError(
-                    "dd.DataFrame.apply only supports axis=1\n"
-                    "  Try: df.apply(func, axis=1)")
+            msg = ("dd.DataFrame.apply only supports axis=1\n"
+                   "  Try: df.apply(func, axis=1)")
+            raise NotImplementedError(msg)
 
         if columns is not no_default:
             warnings.warn("`columns` is deprecated, please use `meta` instead")
@@ -2333,15 +2358,19 @@ class DataFrame(_Frame):
                    "  or:     .apply(func, meta=('x', 'f8'))            for series result")
             warnings.warn(msg)
 
-            try:
-                meta = _emulate(M.apply, self._meta_nonempty, func,
-                                axis=axis, args=args, **kwds)
-            except Exception:
-                raise ValueError("Metadata inference failed, please provide "
-                                 "`meta` keyword")
+            meta = _emulate(M.apply, self._meta_nonempty, func,
+                            axis=axis, args=args, **kwds)
 
         return map_partitions(M.apply, self, func, axis,
                               False, False, None, args, meta=meta, **kwds)
+
+    @derived_from(pd.DataFrame)
+    def applymap(self, func, meta='__no_default__'):
+        return elemwise(M.applymap, self, func, meta=meta)
+
+    @derived_from(pd.DataFrame)
+    def round(self, decimals=0):
+        return elemwise(M.round, self, decimals)
 
     @derived_from(pd.DataFrame)
     def cov(self, min_periods=None):
@@ -2392,7 +2421,7 @@ class DataFrame(_Frame):
 
         lines.append('Data columns (total {} columns):'.format(len(self.columns)))
         lines.extend(column_info)
-        dtype_counts = ['%s(%d)' % k for k in sorted(self.dtypes.value_counts().iteritems())]
+        dtype_counts = ['%s(%d)' % k for k in sorted(self.dtypes.value_counts().iteritems(), key=str)]
         lines.append('dtypes: {}'.format(', '.join(dtype_counts)))
 
         if memory_usage:
@@ -2400,6 +2429,31 @@ class DataFrame(_Frame):
             lines.append('memory usage: {}\n'.format(memory_repr(memory_int)))
 
         put_lines(buf, lines)
+
+    def pivot_table(self, index=None, columns=None,
+                    values=None, aggfunc='mean'):
+        """
+        Create a spreadsheet-style pivot table as a DataFrame. Target ``columns``
+        must have category dtype to infer result's ``columns``.
+        ``index``, ``columns``, ``values`` and ``aggfunc`` must be all scalar.
+
+        Parameters
+        ----------
+        values : scalar
+            column to aggregate
+        index : scalar
+            column to be index
+        columns : scalar
+            column to be columns
+        aggfunc : {'mean', 'sum', 'count'}, default 'mean'
+
+        Returns
+        -------
+        table : DataFrame
+        """
+        from .reshape import pivot_table
+        return pivot_table(self, index=index, columns=columns, values=values,
+                           aggfunc=aggfunc)
 
 
 # bind operators
@@ -2420,6 +2474,13 @@ for name in ['add', 'sub', 'mul', 'div',
 
     meth = getattr(pd.Series, name)
     Series._bind_operator_method(name, meth)
+
+for name in ['lt', 'gt', 'le', 'ge', 'ne', 'eq']:
+    meth = getattr(pd.DataFrame, name)
+    DataFrame._bind_comparison_method(name, meth)
+
+    meth = getattr(pd.Series, name)
+    Series._bind_comparison_method(name, meth)
 
 
 def elemwise_property(attr, s):
@@ -2457,7 +2518,7 @@ def elemwise(op, *args, **kwargs):
     if other:
         dsk = dict(((_name, i),
                    (apply, partial_by_order, list(frs),
-                     {'function': op, 'other': other}))
+                   {'function': op, 'other': other}))
                    for i, frs in enumerate(zip(*keys)))
     else:
         dsk = dict(((_name, i), (op,) + frs) for i, frs in enumerate(zip(*keys)))
@@ -2473,43 +2534,6 @@ def elemwise(op, *args, **kwargs):
     return new_dd_object(dsk, _name, meta, divisions)
 
 
-def remove_empties(seq):
-    """ Remove items of length 0
-
-    >>> remove_empties([1, 2, ('empty', np.nan), 4, 5])
-    [1, 2, 4, 5]
-
-    >>> remove_empties([('empty', np.nan)])
-    [nan]
-
-    >>> remove_empties([])
-    []
-    """
-    if not seq:
-        return seq
-
-    seq2 = [x for x in seq
-              if not (isinstance(x, tuple) and x and x[0] == 'empty')]
-    if seq2:
-        return seq2
-    else:
-        return [seq[0][1]]
-
-
-def empty_safe(func, arg):
-    """
-
-    >>> empty_safe(sum, [1, 2, 3])
-    6
-    >>> empty_safe(sum, [])
-    ('empty', 0)
-    """
-    if len(arg) == 0:
-        return ('empty', func(arg))
-    else:
-        return func(arg)
-
-
 def _maybe_from_pandas(dfs):
     from .io import from_pandas
     dfs = [from_pandas(df, 1) if isinstance(df, (pd.Series, pd.DataFrame))
@@ -2518,9 +2542,10 @@ def _maybe_from_pandas(dfs):
 
 
 @insert_meta_param_description
-def apply_concat_apply(args, chunk=None, aggregate=None, meta=no_default,
-                       token=None, chunk_kwargs=None, aggregate_kwargs=None,
-                       **kwargs):
+def apply_concat_apply(args, chunk=None, aggregate=None, combine=None,
+                       meta=no_default, token=None, split_every=None,
+                       chunk_kwargs=None, aggregate_kwargs=None,
+                       combine_kwargs=None, **kwargs):
     """Apply a function to blocks, then concat, then apply again
 
     Parameters
@@ -2532,16 +2557,26 @@ def apply_concat_apply(args, chunk=None, aggregate=None, meta=no_default,
         Function to operate on each block of data
     aggregate : function concatenated-block -> block
         Function to operate on the concatenated result of chunk
+    combine : function concatenated-block -> block, optional
+        Function to operate on intermediate concatenated results of chunk
+        in a tree-reduction. If not provided, defaults to aggregate.
     $META
     token : str, optional
         The name to use for the output keys.
+    split_every : int, optional
+        Group partitions into groups of this size while performing a
+        tree-reduction. If set to False, no tree-reduction will be used,
+        and all intermediates will be concatenated and passed to ``aggregate``.
+        Default is 8.
     chunk_kwargs : dict, optional
         Keywords for the chunk function only.
     aggregate_kwargs : dict, optional
         Keywords for the aggregate function only.
+    combine_kwargs : dict, optional
+        Keywords for the combine function only
     kwargs :
-        All remaining keywords will be passed to both ``chunk`` and
-        ``aggregate``.
+        All remaining keywords will be passed to ``chunk``, ``aggregate``, and
+        ``combine``.
 
     Examples
     --------
@@ -2560,45 +2595,80 @@ def apply_concat_apply(args, chunk=None, aggregate=None, meta=no_default,
     chunk_kwargs.update(kwargs)
     aggregate_kwargs.update(kwargs)
 
+    if combine is None:
+        if combine_kwargs:
+            raise ValueError("`combine_kwargs` provided with no `combine`")
+        combine = aggregate
+        combine_kwargs = aggregate_kwargs
+    else:
+        if combine_kwargs is None:
+            combine_kwargs = dict()
+        combine_kwargs.update(kwargs)
+
     if not isinstance(args, (tuple, list)):
         args = [args]
 
-    assert all(arg.npartitions == args[0].npartitions
-               for arg in args if isinstance(arg, _Frame))
+    npartitions = set(arg.npartitions for arg in args
+                      if isinstance(arg, _Frame))
+    if len(npartitions) > 1:
+        raise ValueError("All arguments must have same number of partitions")
+    npartitions = npartitions.pop()
+
+    if split_every is None:
+        split_every = 8
+    elif split_every is False:
+        split_every = npartitions
+    elif split_every < 2 or not isinstance(split_every, int):
+        raise ValueError("split_every must be an integer >= 2")
 
     token_key = tokenize(token or (chunk, aggregate), meta, args,
-                         chunk_kwargs, aggregate_kwargs)
+                         chunk_kwargs, aggregate_kwargs, combine_kwargs,
+                         split_every)
 
+    # Chunk
     a = '{0}-chunk-{1}'.format(token or funcname(chunk), token_key)
     if len(args) == 1 and isinstance(args[0], _Frame) and not chunk_kwargs:
-        dsk = dict(((a, i), (chunk, key))
-                   for i, key in enumerate(args[0]._keys()))
+        dsk = {(a, i): (chunk, key) for i, key in enumerate(args[0]._keys())}
     else:
-        dsk = dict(((a, i), (apply, chunk, [(x._name, i)
-                                            if isinstance(x, _Frame)
-                                            else x for x in args],
-                             chunk_kwargs))
-               for i in range(args[0].npartitions))
+        dsk = {(a, i): (apply, chunk, [(x._name, i) if isinstance(x, _Frame)
+                                       else x for x in args], chunk_kwargs)
+               for i in range(args[0].npartitions)}
 
-    b = '{0}-{1}'.format(token or funcname(aggregate), token_key)
-    conc = (_concat, (list, [(a, i) for i in range(args[0].npartitions)]))
-    if not aggregate_kwargs:
-        dsk2 = {(b, 0): (aggregate, conc)}
+    # Combine
+    prefix = '{0}-combine-{1}-'.format(token or funcname(combine), token_key)
+    k = npartitions
+    b = a
+    depth = 0
+    while k > split_every:
+        b = prefix + str(depth)
+        for part_i, inds in enumerate(partition_all(split_every, range(k))):
+            conc = (_concat, [(a, i) for i in inds])
+            if combine_kwargs:
+                dsk[(b, part_i)] = (apply, combine, [conc], combine_kwargs)
+            else:
+                dsk[(b, part_i)] = (combine, conc)
+        k = part_i + 1
+        a = b
+        depth += 1
+
+    # Aggregate
+    b = '{0}-agg-{1}'.format(token or funcname(aggregate), token_key)
+    conc = (_concat, [(a, i) for i in range(k)])
+    if aggregate_kwargs:
+        dsk[(b, 0)] = (apply, aggregate, [conc], aggregate_kwargs)
     else:
-        dsk2 = {(b, 0): (apply, aggregate, [conc], aggregate_kwargs)}
+        dsk[(b, 0)] = (aggregate, conc)
 
     if meta is no_default:
-        try:
-            meta_chunk = _emulate(apply, chunk, args, chunk_kwargs)
-            meta = _emulate(apply, aggregate, [_concat([meta_chunk])],
-                            aggregate_kwargs)
-        except Exception:
-            raise ValueError("Metadata inference failed, please provide "
-                             "`meta` keyword")
+        meta_chunk = _emulate(apply, chunk, args, chunk_kwargs)
+        meta = _emulate(apply, aggregate, [_concat([meta_chunk])],
+                        aggregate_kwargs)
     meta = make_meta(meta)
 
-    dasks = [a.dask for a in args if isinstance(a, _Frame)]
-    return new_dd_object(merge(dsk, dsk2, *dasks), b, meta, [None, None])
+    for arg in args:
+        if isinstance(arg, _Frame):
+            dsk.update(arg.dask)
+    return new_dd_object(dsk, b, meta, [None, None])
 
 
 aca = apply_concat_apply
@@ -2628,7 +2698,8 @@ def _emulate(func, *args, **kwargs):
     Apply a function using args / kwargs. If arguments contain dd.DataFrame /
     dd.Series, using internal cache (``_meta``) for calculation
     """
-    return func(*_extract_meta(args, True), **_extract_meta(kwargs, True))
+    with raise_on_meta_error(funcname(func)):
+        return func(*_extract_meta(args, True), **_extract_meta(kwargs, True))
 
 
 @insert_meta_param_description
@@ -2640,7 +2711,8 @@ def map_partitions(func, *args, **kwargs):
     func : function
         Function applied to each partition.
     args, kwargs :
-        Arguments and keywords to pass to the function.
+        Arguments and keywords to pass to the function.  At least one of the
+        args should be a Dask.dataframe.
     $META
     """
     meta = kwargs.pop('meta', no_default)
@@ -2661,11 +2733,7 @@ def map_partitions(func, *args, **kwargs):
     args = _maybe_align_partitions(args)
 
     if meta is no_default:
-        try:
-            meta = _emulate(func, *args, **kwargs)
-        except Exception:
-            raise ValueError("Metadata inference failed, please provide "
-                             "`meta` keyword")
+        meta = _emulate(func, *args, **kwargs)
 
     if all(isinstance(arg, Scalar) for arg in args):
         dask = {(name, 0):
@@ -2675,26 +2743,30 @@ def map_partitions(func, *args, **kwargs):
         # If `meta` is not a pandas object, the concatenated results will be a
         # different type
         meta = _concat([meta])
-
-    if isinstance(meta, pd.DataFrame):
-        columns = meta.columns
-    elif isinstance(meta, (pd.Series, pd.Index)):
-        columns = meta.name
-    else:
-        columns = None
+    meta = make_meta(meta)
 
     dfs = [df for df in args if isinstance(df, _Frame)]
     dsk = {}
     for i in range(dfs[0].npartitions):
         values = [(arg._name, i if isinstance(arg, _Frame) else 0)
                   if isinstance(arg, (_Frame, Scalar)) else arg for arg in args]
-        values = (apply, func, (tuple, values), kwargs)
-        if columns is not None:
-            values = (_rename, columns, values)
-        dsk[(name, i)] = values
+        dsk[(name, i)] = (apply_and_enforce, func, values, kwargs, meta)
 
     dasks = [arg.dask for arg in args if isinstance(arg, (_Frame, Scalar))]
     return new_dd_object(merge(dsk, *dasks), name, meta, args[0].divisions)
+
+
+def apply_and_enforce(func, args, kwargs, meta):
+    """Apply a function, and enforce the output to match meta
+
+    Ensures the output has the same columns, even if empty."""
+    df = func(*args, **kwargs)
+    if isinstance(df, (pd.DataFrame, pd.Series, pd.Index)):
+        if len(df) == 0:
+            return meta
+        c = meta.columns if isinstance(df, pd.DataFrame) else meta.name
+        return _rename(c, df)
+    return df
 
 
 def _rename(columns, df):
@@ -2704,7 +2776,6 @@ def _rename(columns, df):
 
     Parameters
     ----------
-
     columns : tuple, string, pd.DataFrame or pd.Series
         Column names, Series name or pandas instance which has the
         target column names / name.
@@ -2713,11 +2784,11 @@ def _rename(columns, df):
     """
     assert not isinstance(df, _Frame)
 
-    if isinstance(columns, Iterator):
-        columns = list(columns)
-
     if columns is no_default:
         return df
+
+    if isinstance(columns, Iterator):
+        columns = list(columns)
 
     if isinstance(df, pd.DataFrame):
         if isinstance(columns, pd.DataFrame):
@@ -2727,14 +2798,16 @@ def _rename(columns, df):
             if columns.equals(df.columns):
                 # if target is identical, rename is not necessary
                 return df
-            # each functions must be pure op, do not use df.columns = columns
-            return df.rename(columns=dict(zip(df.columns, columns)))
+        # deep=False doesn't doesn't copy any data/indices, so this is cheap
+        df = df.copy(deep=False)
+        df.columns = columns
+        return df
     elif isinstance(df, (pd.Series, pd.Index)):
         if isinstance(columns, (pd.Series, pd.Index)):
             columns = columns.name
-        if name == columns:
+        if df.name == columns:
             return df
-        return pd.Series(df, name=columns)
+        return df.rename(columns)
     # map_partition may pass other types
     return df
 
@@ -2749,7 +2822,6 @@ def _rename_dask(df, names):
 
     Parameters
     ----------
-
     df : dd.DataFrame or dd.Series
         target DataFrame / Series to be renamed
     names : tuple, string
@@ -2778,7 +2850,12 @@ def quantile(df, q):
     from dask.array.percentile import _percentile, merge_percentiles
 
     # currently, only Series has quantile method
-    if isinstance(q, (list, tuple, np.ndarray)):
+    if isinstance(df, Index):
+        meta = pd.Series(df._meta_nonempty).quantile(q)
+    else:
+        meta = df._meta_nonempty.quantile(q)
+
+    if isinstance(meta, pd.Series):
         # Index.quantile(list-like) must be pd.Series, not pd.Index
         df_name = df.name
         finalize_tsk = lambda tsk: (pd.Series, tsk, q, None, df_name)
@@ -2787,11 +2864,6 @@ def quantile(df, q):
         finalize_tsk = lambda tsk: (getitem, tsk, 0)
         return_type = Scalar
         q = [q]
-
-    if isinstance(df, Index):
-        meta = pd.Series(df._meta_nonempty).quantile(q)
-    else:
-        meta = df._meta_nonempty.quantile(q)
 
     # pandas uses quantile in [0, 1]
     # numpy / everyone else uses [0, 100]
@@ -2802,7 +2874,7 @@ def quantile(df, q):
         name = 'quantiles-' + token
         empty_index = pd.Index([], dtype=float)
         return Series({(name, 0): pd.Series([], name=df.name, index=empty_index)},
-                       name, df._meta, [None, None])
+                      name, df._meta, [None, None])
     else:
         new_divisions = [np.min(q), np.max(q)]
 
@@ -2873,7 +2945,7 @@ def cov_corr_chunk(df, corr=False):
     cov = df.cov().values
     dtype = [('sum', sums.dtype), ('count', counts.dtype), ('cov', cov.dtype)]
     if corr:
-        m = np.nansum((x - sums/np.where(counts, counts, np.nan))**2, 0)
+        m = np.nansum((x - sums / np.where(counts, counts, np.nan)) ** 2, 0)
         dtype.append(('m', m.dtype))
 
     out = np.empty(counts.shape, dtype=dtype)
@@ -2898,8 +2970,8 @@ def cov_corr_agg(data, meta, min_periods=2, corr=False, scalar=False):
     s2 = sums[1:]
     n1 = cum_counts[:-1]
     n2 = counts[1:]
-    d = (s2/n2) - (s1/n1)
-    C = (np.nansum((n1 * n2)/(n1 + n2) * (d * d.transpose((0, 2, 1))), 0) +
+    d = (s2 / n2) - (s1 / n1)
+    C = (np.nansum((n1 * n2) / (n1 + n2) * (d * d.transpose((0, 2, 1))), 0) +
          np.nansum(data['cov'], 0))
 
     C[cum_counts[-1] < min_periods] = np.nan
@@ -2907,11 +2979,12 @@ def cov_corr_agg(data, meta, min_periods=2, corr=False, scalar=False):
     if corr:
         mu = cum_sums[-1] / nobs
         counts_na = np.where(counts, counts, np.nan)
-        m2 = np.nansum(data['m'] + counts*(sums/counts_na - mu)**2, axis=0)
+        m2 = np.nansum(data['m'] + counts * (sums / counts_na - mu) ** 2,
+                       axis=0)
         den = np.sqrt(m2 * m2.T)
     else:
         den = nobs - 1
-    mat = C/den
+    mat = C / den
     if scalar:
         return mat[0, 1]
     return pd.DataFrame(mat, columns=meta.columns, index=meta.columns)
@@ -2929,7 +3002,6 @@ def pd_split(df, p, random_state=None):
     1  2  3
     2  3  4
     5  6  7
-
     >>> b
        a  b
     0  1  2
@@ -2992,10 +3064,10 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
     --------
 
     >>> repartition_divisions([1, 3, 7], [1, 4, 6, 7], 'a', 'b', 'c')  # doctest: +SKIP
-    {('b', 0): (<function _loc at ...>, ('a', 0), 1, 3, False),
-     ('b', 1): (<function _loc at ...>, ('a', 1), 3, 4, False),
-     ('b', 2): (<function _loc at ...>, ('a', 1), 4, 6, False),
-     ('b', 3): (<function _loc at ...>, ('a', 1), 6, 7, False)
+    {('b', 0): (<function _loc_repartition at ...>, ('a', 0), 1, 3, False),
+     ('b', 1): (<function _loc_repartition at ...>, ('a', 1), 3, 4, False),
+     ('b', 2): (<function _loc_repartition at ...>, ('a', 1), 4, 6, False),
+     ('b', 3): (<function _loc_repartition at ...>, ('a', 1), 6, 7, False)
      ('c', 0): (<function concat at ...>,
                 (<type 'list'>, [('b', 0), ('b', 1)])),
      ('c', 1): ('b', 2),
@@ -3051,16 +3123,16 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
     while (i < len(a) and j < len(b)):
         if a[i] < b[j]:
             # tuple is something like:
-            # (_loc, ('from_pandas-#', 0), 3, 4, False))
-            d[(out1, k)] = (_loc, (name, i - 1), low, a[i], False)
+            # (methods._loc_partition, ('from_pandas-#', 0), 3, 4, False))
+            d[(out1, k)] = (methods._loc_repartition, (name, i - 1), low, a[i], False)
             low = a[i]
             i += 1
         elif a[i] > b[j]:
-            d[(out1, k)] = (_loc, (name, i - 1), low, b[j], False)
+            d[(out1, k)] = (methods._loc_repartition, (name, i - 1), low, b[j], False)
             low = b[j]
             j += 1
         else:
-            d[(out1, k)] = (_loc, (name, i - 1), low, b[j], False)
+            d[(out1, k)] = (methods._loc_repartition, (name, i - 1), low, b[j], False)
             low = b[j]
             i += 1
             j += 1
@@ -3073,7 +3145,7 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
             # always use right-most of old division
             # because it may contain last element
             m = len(a) - 2
-            d[(out1, k)] = (_loc, (name, m), low, b[_j], False)
+            d[(out1, k)] = (methods._loc_repartition, (name, m), low, b[_j], False)
             low = b[_j]
             c.append(low)
             k += 1
@@ -3081,7 +3153,7 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
         # even if new division is processed through,
         # right-most element of old division can remain
         if last_elem and i < len(a):
-            d[(out1, k)] = (_loc, (name, i - 1), a[i], a[i], False)
+            d[(out1, k)] = (methods._loc_repartition, (name, i - 1), a[i], a[i], False)
             k += 1
         c.append(a[-1])
 
@@ -3104,7 +3176,7 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
         if len(tmp) == 0:
             # dummy slice to return empty DataFrame or Series,
             # which retain original data attributes (columns / name)
-            d[(out2, j - 1)] = (_loc, (name, 0), a[0], a[0], False)
+            d[(out2, j - 1)] = (methods._loc_repartition, (name, 0), a[0], a[0], False)
         elif len(tmp) == 1:
             d[(out2, j - 1)] = tmp[0]
         else:
@@ -3112,7 +3184,7 @@ def repartition_divisions(a, b, name, out1, out2, force=False):
                 raise ValueError('check for duplicate partitions\nold:\n%s\n\n'
                                  'new:\n%s\n\ncombined:\n%s'
                                  % (pformat(a), pformat(b), pformat(c)))
-            d[(out2, j - 1)] = (pd.concat, (list, tmp))
+            d[(out2, j - 1)] = (pd.concat, tmp)
         j += 1
     return d
 
@@ -3121,15 +3193,15 @@ def repartition_npartitions(df, npartitions):
     """ Repartition dataframe to a smaller number of partitions """
     npartitions_ratio = df.npartitions / npartitions
     new_partitions_boundaries = [int(new_partition_index * npartitions_ratio)
-                                    for new_partition_index in range(npartitions + 1)]
+                                 for new_partition_index in range(npartitions + 1)]
     new_name = 'repartition-%d-%s' % (npartitions, tokenize(df))
-    dsk = {(new_name, new_partition_index):
-            (pd.concat,
-             [(df._name, old_partition_index)
-                for old_partition_index in range(
-                    new_partitions_boundaries[new_partition_index],
-                    new_partitions_boundaries[new_partition_index + 1])])
-            for new_partition_index in range(npartitions)}
+    dsk = {}
+    for new_partition_index in range(npartitions):
+        value = (pd.concat, [(df._name, old_partition_index)
+                             for old_partition_index in
+                             range(new_partitions_boundaries[new_partition_index],
+                                   new_partitions_boundaries[new_partition_index + 1])])
+        dsk[new_name, new_partition_index] = value
     divisions = [df.divisions[new_partition_index]
                  for new_partition_index in new_partitions_boundaries]
     return DataFrame(merge(df.dask, dsk), new_name, df._meta, divisions)
@@ -3170,8 +3242,8 @@ def repartition(df, divisions=None, force=False):
         out = 'repartition-merge-' + token
         dsk = repartition_divisions(df.divisions, divisions,
                                     df._name, tmp, out, force=force)
-        return df._constructor(merge(df.dask, dsk), out,
-                               df._meta, divisions)
+        return new_dd_object(merge(df.dask, dsk), out,
+                             df._meta, divisions)
     elif isinstance(df, (pd.Series, pd.DataFrame)):
         name = 'repartition-dataframe-' + token
         from .utils import shard_df_on_index
@@ -3179,74 +3251,6 @@ def repartition(df, divisions=None, force=False):
         dsk = dict(((name, i), df) for i, df in enumerate(dfs))
         return new_dd_object(dsk, name, df, divisions)
     raise ValueError('Data must be DataFrame or Series')
-
-
-class Accessor(object):
-    def __init__(self, series):
-        if not isinstance(series, Series):
-            raise ValueError('Accessor cannot be initialized')
-        self._series = series
-
-    def _property_map(self, key):
-        out = self.getattr(self._series._meta, key)
-        meta = pd.Series([], dtype=out.dtype, name=getattr(out, 'name', None))
-        return map_partitions(self.getattr, self._series, key, meta=meta)
-
-    def _function_map(self, key, *args):
-        out = self.call(self._series._meta, key, *args)
-        meta = pd.Series([], dtype=out.dtype, name=getattr(out, 'name', None))
-        return map_partitions(self.call, self._series, key, *args, meta=meta)
-
-    def __dir__(self):
-        return sorted(set(dir(type(self)) + list(self.__dict__) +
-                      dir(self.ns)))
-
-    def __getattr__(self, key):
-        if key in dir(self.ns):
-            if isinstance(getattr(self.ns, key), property):
-                return self._property_map(key)
-            else:
-                return partial(self._function_map, key)
-        else:
-            raise AttributeError(key)
-
-
-class DatetimeAccessor(Accessor):
-    """ Accessor object for datetimelike properties of the Series values.
-
-    Examples
-    --------
-
-    >>> s.dt.microsecond  # doctest: +SKIP
-    """
-    ns = pd.Series.dt
-
-    @staticmethod
-    def getattr(obj, attr):
-        return getattr(obj.dt, attr)
-
-    @staticmethod
-    def call(obj, attr, *args):
-        return getattr(obj.dt, attr)(*args)
-
-
-class StringAccessor(Accessor):
-    """ Accessor object for string properties of the Series values.
-
-    Examples
-    --------
-
-    >>> s.str.lower()  # doctest: +SKIP
-    """
-    ns = pd.Series.str
-
-    @staticmethod
-    def getattr(obj, attr):
-        return getattr(obj.str, attr)
-
-    @staticmethod
-    def call(obj, attr, *args):
-        return getattr(obj.str, attr)(*args)
 
 
 def set_sorted_index(df, index, drop=True, **kwargs):
@@ -3267,7 +3271,7 @@ def compute_divisions(df, **kwargs):
 
     if (sorted(mins) != list(mins) or
             sorted(maxes) != list(maxes) or
-            any(a >= b for a, b in zip(mins, maxes))):
+            any(a > b for a, b in zip(mins, maxes))):
         raise ValueError("Partitions must be sorted ascending with the index",
                          mins, maxes)
 
@@ -3285,6 +3289,14 @@ def _reduction_chunk(x, aca_chunk=None, **kwargs):
     return o.to_frame().T if isinstance(o, pd.Series) else o
 
 
+def _reduction_combine(x, aca_combine=None, **kwargs):
+    if isinstance(x, list):
+        x = pd.Series(x)
+    o = aca_combine(x, **kwargs)
+    # Return a dataframe so that the concatenated version is also a dataframe
+    return o.to_frame().T if isinstance(o, pd.Series) else o
+
+
 def _reduction_aggregate(x, aca_aggregate=None, **kwargs):
     if isinstance(x, list):
         x = pd.Series(x)
@@ -3297,45 +3309,42 @@ def drop_columns(df, columns, dtype):
     return df
 
 
-def idxmaxmin_chunk(x, fn, axis=0, skipna=True, **kwargs):
-    idx = getattr(x, fn)(axis=axis, skipna=skipna)
+def idxmaxmin_chunk(x, fn=None, skipna=True):
+    idx = getattr(x, fn)(skipna=skipna)
     minmax = 'max' if fn == 'idxmax' else 'min'
-    value = getattr(x, minmax)(axis=axis, skipna=skipna)
-    n = len(x)
-    if isinstance(idx, pd.Series):
-        chunk = pd.DataFrame({'idx': idx, 'value': value, 'n': [n] * len(idx)})
-        chunk['idx'] = chunk['idx'].astype(type(idx.iloc[0]))
-    else:
-        chunk = pd.DataFrame({'idx': [idx], 'value': [value], 'n': [n]})
-        chunk['idx'] = chunk['idx'].astype(type(idx))
-    return chunk
+    value = getattr(x, minmax)(skipna=skipna)
+    if isinstance(x, pd.DataFrame):
+        return pd.DataFrame({'idx': idx, 'value': value})
+    return pd.DataFrame({'idx': [idx], 'value': [value]})
 
 
-def idxmaxmin_row(x, fn, skipna=True):
-    idx = x.idx.reset_index(drop=True)
-    value = x.value.reset_index(drop=True)
-    subidx = getattr(value, fn)(skipna=skipna)
-
-    # if skipna is False, pandas returns NaN so mimic behavior
-    if pd.isnull(subidx):
-        return subidx
-
-    return idx.iloc[subidx]
+def idxmaxmin_row(x, fn=None, skipna=True):
+    x = x.set_index('idx')
+    idx = getattr(x.value, fn)(skipna=skipna)
+    minmax = 'max' if fn == 'idxmax' else 'min'
+    value = getattr(x.value, minmax)(skipna=skipna)
+    return pd.DataFrame({'idx': [idx], 'value': [value]})
 
 
-def idxmaxmin_agg(x, fn, skipna=True, **kwargs):
-    indices = list(set(x.index.tolist()))
-    idxmaxmin = [idxmaxmin_row(x.ix[idx], fn, skipna=skipna) for idx in indices]
-    if len(idxmaxmin) == 1:
-        return idxmaxmin[0]
-    else:
-        return pd.Series(idxmaxmin, index=indices)
+def idxmaxmin_combine(x, fn=None, skipna=True):
+    return (x.groupby(level=0)
+             .apply(idxmaxmin_row, fn=fn, skipna=skipna)
+             .reset_index(level=1, drop=True))
+
+
+def idxmaxmin_agg(x, fn=None, skipna=True, scalar=False):
+    res = idxmaxmin_combine(x, fn, skipna=skipna)['idx']
+    if scalar:
+        return res[0]
+    res.name = None
+    return res
 
 
 def safe_head(df, n):
     r = df.head(n=n)
     if len(r) != n:
-        warnings.warn("Insufficient elements for `head`. {0} elements "
-             "requested, only {1} elements available. Try passing larger "
-             "`npartitions` to `head`.".format(n, len(r)))
+        msg = ("Insufficient elements for `head`. {0} elements "
+               "requested, only {1} elements available. Try passing larger "
+               "`npartitions` to `head`.")
+        warnings.warn(msg.format(n, len(r)))
     return r

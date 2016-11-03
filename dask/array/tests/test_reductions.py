@@ -134,8 +134,9 @@ def test_reductions_2D(dtype):
 
 
 @pytest.mark.parametrize(['dfunc', 'func'],
-        [(da.argmin, np.argmin), (da.argmax, np.argmax),
-         (da.nanargmin, np.nanargmin), (da.nanargmax, np.nanargmax)])
+                         [(da.argmin, np.argmin), (da.argmax, np.argmax),
+                          (da.nanargmin, np.nanargmin),
+                          (da.nanargmax, np.nanargmax)])
 def test_arg_reductions(dfunc, func):
     x = np.random.random((10, 10, 10))
     a = da.from_array(x, chunks=(3, 4, 5))
@@ -161,7 +162,8 @@ def test_arg_reductions(dfunc, func):
 
 
 @pytest.mark.parametrize(['dfunc', 'func'],
-         [(da.nanargmin, np.nanargmin), (da.nanargmax, np.nanargmax)])
+                         [(da.nanargmin, np.nanargmin),
+                          (da.nanargmax, np.nanargmax)])
 def test_nanarg_reductions(dfunc, func):
     x = np.random.random((10, 10, 10))
     x[5] = np.nan
@@ -222,11 +224,11 @@ def test_reductions_2D_nans():
 
 def test_moment():
     def moment(x, n, axis=None):
-        return ((x - x.mean(axis=axis, keepdims=True))**n).sum(
-                axis=axis)/np.ones_like(x).sum(axis=axis)
+        return (((x - x.mean(axis=axis, keepdims=True)) ** n).sum(axis=axis) /
+                np.ones_like(x).sum(axis=axis))
 
     # Poorly conditioned
-    x = np.array([1., 2., 3.]*10).reshape((3, 10)) + 1e8
+    x = np.array([1., 2., 3.] * 10).reshape((3, 10)) + 1e8
     a = da.from_array(x, chunks=5)
     assert_eq(a.moment(2), moment(x, 2))
     assert_eq(a.moment(3), moment(x, 3))

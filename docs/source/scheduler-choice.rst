@@ -9,7 +9,7 @@ different choices so that users can make decisions that improve performance.
 Briefly, the current options are as follows:
 
 *   ``dask.threaded.get``: Uses multiple threads in the same process.  Good for
-    numeric code that releases the GIL (NumPy, Pandas, SKLearn, Numba) because
+    numeric code that releases the GIL_ (NumPy, Pandas, SKLearn, Numba) because
     data is free to share.  The default scheduler for ``dask.array``,
     ``dask.dataframe`` and ``dask.delayed``
 *   ``dask.multiprocessing.get``: Uses multiple processes.  Good for Python
@@ -18,7 +18,7 @@ Briefly, the current options are as follows:
     scheduler for ``dask.bag`` and sometimes useful with ``dask.dataframe``.
 *   ``dask.async.get_sync``: Uses the single main thread.  Good for profiling
     and debugging because all code is run sequentially
-*   ``distributed.Executor.get``:  Uses multiple machines connected over
+*   ``distributed.Client.get``:  Uses multiple machines connected over
     sockets.  Good for larger work but also a viable alternative to
     ``dask.multiprocessing`` on a single machine.  Also sometimes used for its
     improved diagnostic tools.
@@ -28,7 +28,7 @@ Threads vs Processes
 
 Threads are good because they can share data back and forth in the same memory
 space without transfer costs.  Threads can pass large arrays between each other
-instantaneously.  Unfortunately due to the GIL pure Python code (like JSON
+instantaneously.  Unfortunately due to the GIL_ pure Python code (like JSON
 parsing) does not parallelize well under threads, and so when computing on pure
 Python objects, like strings or lists or our custom objects, we may prefer to
 use processes.  Threads are good when using numeric data and when the
@@ -65,7 +65,7 @@ on a distributed cluster.  This allows computations to scale to significantly
 larger problems.  This doesn't come for free though, as you will need to `setup
 the distributed scheduler`_ on those machines.
 
-.. _`setup the distributed scheduler`: http://distributed.readthedocs.io/en/latest/setup.html
+.. _`setup the distributed scheduler`: https://distributed.readthedocs.io/en/latest/setup.html
 
 Distributed Scheduler on a Single Machine
 -----------------------------------------
@@ -73,14 +73,14 @@ Distributed Scheduler on a Single Machine
 It is also reasonable to use the `distributed scheduler`_ on a single machine.
 The algorithms, reporting, and diagnostics in this scheduler are more effective
 in some cases.  You can create a local "cluster" and use this scheduler by
-default by creating a ``dask.distributed.Executor`` with no arguments.
+default by creating a ``dask.distributed.Client`` with no arguments.
 
 .. code-block:: python
 
-   from dask.distributed import Executor
-   e = Executor(set_as_default=True)
+   from dask.distributed import Client
+   client = Client(set_as_default=True)
 
-.. _`distributed scheduler`: http://distributed.readthedocs.io/en/latest/
+.. _`distributed scheduler`: https://distributed.readthedocs.io/en/latest/
 
 Diagnostics
 ~~~~~~~~~~~
@@ -88,7 +88,7 @@ Diagnostics
 One reason to do this is to get access to the pleasant `web interface`_, which
 gives a real-time visualization of what's computing on your cores.
 
-.. _`web interface`: http://distributed.readthedocs.io/en/latest/web.html
+.. _`web interface`: https://distributed.readthedocs.io/en/latest/web.html
 
 Asynchronous Interface
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -111,3 +111,5 @@ needs to be done.  This back-and-forth communication can dominate costs and
 slow down overall performance.  The distributed scheduler does not have this
 flaw, can reason well about data-in-place, and can move small pieces of data to
 larger ones.
+
+.. _GIL: https://docs.python.org/3/glossary.html#term-gil

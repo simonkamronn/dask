@@ -25,7 +25,7 @@ def fractional_slice(task, axes):
     >>> fractional_slice(('x', 2.9, 5.1), {0: 2, 1: 3})  # doctest: +SKIP
     (getitem, ('x', 3, 5), (slice(0, 2), slice(-3, None)))
     """
-    rounded = (task[0],) + tuple(map(round, task[1:]))
+    rounded = (task[0],) + tuple(int(round(i)) for i in task[1:])
 
     index = []
     for i, (t, r) in enumerate(zip(task[1:], rounded[1:])):
@@ -106,7 +106,7 @@ def ghost_internal(x, axes):
     axes: dict
         The size of the shared boundary per axis
 
-    The axes dict informs how many cells to overlap between neighboring blocks
+    The axes input informs how many cells to overlap between neighboring blocks
     {0: 2, 2: 5} means share two cells in 0 axis, 5 cells in 2 axis
     """
     dims = list(map(len, x.chunks))
@@ -124,7 +124,7 @@ def ghost_internal(x, axes):
             interior_slices[k] = frac_slice
 
         ghost_blocks[(name,) + k[1:]] = (concatenate3,
-                                          (concrete, expand_key2(k)))
+                                         (concrete, expand_key2(k)))
 
     chunks = []
     for i, bds in enumerate(x.chunks):
@@ -139,7 +139,7 @@ def ghost_internal(x, axes):
             chunks.append(left + mid + right)
 
     return Array(merge(interior_slices, ghost_blocks, x.dask),
-                 name, chunks)
+                 name, chunks, dtype=x._dtype)
 
 
 def trim_internal(x, axes):
@@ -149,8 +149,9 @@ def trim_internal(x, axes):
     each block
 
     See also
-        chunk.trim
-        map_blocks
+    --------
+    dask.array.chunk.trim
+    dask.array.map_blocks
     """
     olist = []
     for i, bd in enumerate(x.chunks):
@@ -161,7 +162,8 @@ def trim_internal(x, axes):
 
     chunks = tuple(olist)
 
-    return map_blocks(partial(chunk.trim, axes=axes), x, chunks=chunks)
+    return map_blocks(partial(chunk.trim, axes=axes), x, chunks=chunks,
+                      dtype=x.dtype)
 
 
 def periodic(x, axis, depth):
@@ -198,7 +200,7 @@ def reflect(x, axis, depth):
                 (slice(depth - 1, None, -1),) +
                 (slice(None, None, None),) * (x.ndim - axis - 1))
     right = ((slice(None, None, None),) * axis +
-             (slice(-1, -depth-1, -1),) +
+             (slice(-1, -depth - 1, -1),) +
              (slice(None, None, None),) * (x.ndim - axis - 1))
     l = x[left]
     r = x[right]
@@ -256,7 +258,6 @@ def boundaries(x, depth=None, kind=None):
 
     See Also
     --------
-
     periodic
     constant
     """
@@ -297,14 +298,15 @@ def ghost(x, depth, boundary):
         The size of the shared boundary per axis
     boundary: dict
         The boundary condition on each axis. Options are 'reflect', 'periodic',
-        'nearest', 'none', an integer will fill the boundary with that integer.
+        'nearest', 'none', or an array value.  Such a value will fill the
+        boundary with that value.
 
-    The axes dict informs how many cells to overlap between neighboring blocks
-    {0: 2, 2: 5} means share two cells in 0 axis, 5 cells in 2 axis
+    The depth input informs how many cells to overlap between neighboring
+    blocks ``{0: 2, 2: 5}`` means share two cells in 0 axis, 5 cells in 2 axis.
+    Axes missing from this input will not be overlapped.
 
     Examples
     --------
-
     >>> import numpy as np
     >>> import dask.array as da
 
@@ -350,7 +352,7 @@ def ghost(x, depth, boundary):
                              (d, min(c)))
     x2 = boundaries(x, depth2, boundary2)
     x3 = ghost_internal(x2, depth2)
-    trim = dict((k, v*2 if boundary2.get(k, 'none') != 'none' else 0)
+    trim = dict((k, v * 2 if boundary2.get(k, 'none') != 'none' else 0)
                 for k, v in depth2.items())
     x4 = chunk.trim(x3, trim)
     return x4

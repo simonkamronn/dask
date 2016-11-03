@@ -74,13 +74,15 @@ def order(dsk, dependencies=None):
     {'a': 2, 'c': 1, 'b': 3, 'd': 0}
     """
     if dependencies is None:
-        dependencies = dict((k, get_dependencies(dsk, k)) for k in dsk)
+        dependencies = {k: get_dependencies(dsk, k) for k in dsk}
     dependents = reverse_dict(dependencies)
 
     ndeps = ndependents(dependencies, dependents)
     maxes = child_max(dependencies, dependents, ndeps)
+
     def key(x):
         return -maxes.get(x, 0), str(x)
+
     return dfs(dependencies, dependents, key=key)
 
 

@@ -32,6 +32,7 @@ def _percentile(a, q, interpolation='linear'):
 
 names = ('percentile-%d' % i for i in count(1))
 
+
 def percentile(a, q, interpolation='linear'):
     """ Approximate percentile of 1-D array
 
@@ -44,13 +45,18 @@ def percentile(a, q, interpolation='linear'):
     token = tokenize(a, list(q), interpolation)
     name = 'percentile_chunk-' + token
     dsk = dict(((name, i), (_percentile, (key), q, interpolation))
-            for i, key in enumerate(a._keys()))
+               for i, key in enumerate(a._keys()))
 
     name2 = 'percentile-' + token
     dsk2 = {(name2, 0): (merge_percentiles, q, [q] * len(a.chunks[0]),
                          sorted(dsk), a.chunks[0], interpolation)}
 
-    return Array(merge(a.dask, dsk, dsk2), name2, chunks=((len(q),),))
+    dtype = a.dtype
+    if np.issubdtype(dtype, np.integer):
+        dtype = (np.array([], dtype=dtype) / 0.5).dtype
+
+    return Array(merge(a.dask, dsk, dsk2), name2, chunks=((len(q),),),
+                 dtype=dtype)
 
 
 def merge_percentiles(finalq, qs, vals, Ns, interpolation='lower'):
@@ -150,7 +156,7 @@ def merge_percentiles(finalq, qs, vals, Ns, interpolation='lower'):
         elif interpolation == 'higher':
             rv = combined_vals[upper]
         elif interpolation == 'midpoint':
-            rv = 0.5*(combined_vals[lower] + combined_vals[upper])
+            rv = 0.5 * (combined_vals[lower] + combined_vals[upper])
         elif interpolation == 'nearest':
             lower_residual = np.abs(combined_q[lower] - desired_q)
             upper_residual = np.abs(combined_q[upper] - desired_q)

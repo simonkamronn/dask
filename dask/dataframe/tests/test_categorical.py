@@ -1,3 +1,7 @@
+import operator
+import warnings
+
+import numpy as np
 import pandas as pd
 import pandas.util.testing as tm
 import pytest
@@ -5,7 +9,26 @@ import pytest
 import dask
 from dask.async import get_sync
 import dask.dataframe as dd
-from dask.dataframe.utils import make_meta
+from dask.dataframe.utils import make_meta, assert_eq, is_categorical_dtype
+
+
+@pytest.fixture(params=[True, False])
+def cat_series(request):
+    ordered = request.param
+    return pd.Series(pd.Categorical(list('bacbac'), ordered=ordered))
+
+
+def test_is_categorical_dtype():
+    df = pd.DataFrame({'cat': pd.Categorical([1, 2, 3, 4]),
+                       'x': [1, 2, 3, 4]})
+
+    assert is_categorical_dtype(df['cat'])
+    assert not is_categorical_dtype(df['x'])
+
+    ddf = dd.from_pandas(df, 2)
+
+    assert is_categorical_dtype(ddf['cat'])
+    assert not is_categorical_dtype(ddf['x'])
 
 
 def test_categorize():
@@ -53,7 +76,7 @@ def test_categorical_set_index(shuffle):
 
 
 def test_dataframe_categoricals():
-    df = pd.DataFrame({'x': list('a'*5 + 'b'*5 + 'c'*5),
+    df = pd.DataFrame({'x': list('a' * 5 + 'b' * 5 + 'c' * 5),
                        'y': range(15)})
     df.x = df.x.astype('category')
     ddf = dd.from_pandas(df, npartitions=2)
@@ -63,18 +86,57 @@ def test_dataframe_categoricals():
     assert 'cat' not in dir(ddf.y)
 
 
-def test_categories():
-    df = pd.DataFrame({'x': [1, 2, 3, 4],
-                       'y': pd.Categorical(['a', 'b', 'a', 'c'])},
-                      index=pd.CategoricalIndex(['x', 'x', 'y', 'y']))
+def test_categorize_nan():
+    df = dd.from_pandas(pd.DataFrame({"A": ['a', 'b', 'a', float('nan')]}),
+                        npartitions=2)
+    with warnings.catch_warnings(record=True) as record:
+        df.categorize().compute()
+    assert len(record) == 0
 
-    categories = dd.categorical.get_categories(df)
-    assert set(categories.keys()) == set(['y', '.index'])
-    assert list(categories['y']) == ['a', 'b', 'c']
-    assert list(categories['.index']) == ['x', 'y']
 
-    df2 = dd.categorical.strip_categories(df)
-    assert not dd.categorical.get_categories(df2)
+class TestCategoricalAccessor:
 
-    df3 = dd.categorical._categorize(categories, df2)
-    tm.assert_frame_equal(df, df3)
+    @pytest.mark.parametrize('prop, compare', [
+        ('categories', tm.assert_index_equal),
+        ('ordered', assert_eq),
+        ('codes', assert_eq),
+    ])
+    def test_properties(self, cat_series, prop, compare):
+        a = dd.from_pandas(cat_series, npartitions=2)
+        expected = getattr(cat_series.cat, prop)
+        result = getattr(a.cat, prop)
+        compare(result, expected)
+
+    @pytest.mark.parametrize('method, kwargs', [
+        ('add_categories', dict(new_categories=['d', 'e'])),
+        ('as_ordered', {}),
+        ('as_unordered', {}),
+        ('as_ordered', {}),
+        ('remove_categories', dict(removals=['a'])),
+        ('rename_categories', dict(new_categories=['d', 'e', 'f'])),
+        ('reorder_categories', dict(new_categories=['a', 'b', 'c'])),
+        ('set_categories', dict(new_categories=['a', 'e', 'b'])),
+        ('remove_unused_categories', {}),
+    ])
+    def test_callable(self, cat_series, method, kwargs):
+        a = dd.from_pandas(cat_series, npartitions=2)
+        op = operator.methodcaller(method, **kwargs)
+        expected = op(cat_series.cat)
+        result = op(a.cat)
+        assert_eq(result, expected)
+        assert_eq(result._meta.cat.categories, expected.cat.categories)
+        assert_eq(result._meta.cat.ordered, expected.cat.ordered)
+
+    def test_categorical_empty(self):
+        # GH 1705
+
+        def make_empty():
+            return pd.DataFrame({"A": pd.Categorical([np.nan, np.nan])})
+
+        def make_full():
+            return pd.DataFrame({"A": pd.Categorical(['a', 'a'])})
+
+        a = dd.from_delayed([dask.delayed(make_empty)(),
+                             dask.delayed(make_full)()])
+        # Used to raise an IndexError
+        a.A.cat.categories

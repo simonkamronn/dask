@@ -36,12 +36,12 @@ def _resample_series(series, start, end, reindex_closed, rule,
 
 
 def _resample_bin_and_out_divs(divisions, rule, closed='left', label='left'):
-    rule = pd.datetools.to_offset(rule)
+    rule = pd.tseries.frequencies.to_offset(rule)
     g = pd.TimeGrouper(rule, how='count', closed=closed, label=label)
 
     # Determine bins to apply `how` to. Disregard labeling scheme.
     divs = pd.Series(range(len(divisions)), index=divisions)
-    temp = divs.resample(rule, how='count', closed=closed, label='left')
+    temp = divs.resample(rule, closed=closed, label='left').count()
     tempdivs = temp.loc[temp > 0].index
 
     # Cleanup closed == 'right' and label == 'right'
@@ -78,12 +78,13 @@ def _resample_bin_and_out_divs(divisions, rule, closed='left', label='left'):
 class Resampler(object):
     def __init__(self, obj, rule, **kwargs):
         if not obj.known_divisions:
-            raise ValueError("Can only resample dataframes with known divisions"
-                    "\nSee dask.pydata.io/en/latest/dataframe-partitions.html"
-                    "\nfor more information.")
+            msg = ("Can only resample dataframes with known divisions\n"
+                   "See dask.pydata.io/en/latest/dataframe-partitions.html\n"
+                   "for more information.")
+            raise ValueError(msg)
         self.obj = obj
-        rule = pd.datetools.to_offset(rule)
-        day_nanos = pd.datetools.Day().nanos
+        rule = pd.tseries.frequencies.to_offset(rule)
+        day_nanos = pd.tseries.frequencies.Day().nanos
 
         if getnanos(rule) and day_nanos % rule.nanos:
             raise NotImplementedError('Resampling frequency %s that does'
@@ -107,7 +108,7 @@ class Resampler(object):
         keys = partitioned._keys()
         dsk = partitioned.dask
 
-        args = zip(keys, outdivs, outdivs[1:], ['left']*(len(keys)-1) + [None])
+        args = zip(keys, outdivs, outdivs[1:], ['left'] * (len(keys) - 1) + [None])
         for i, (k, s, e, c) in enumerate(args):
             dsk[(name, i)] = (_resample_series, k, s, e, c,
                               rule, kwargs, how, fill_value)

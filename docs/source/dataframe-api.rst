@@ -15,7 +15,6 @@ Top level user functions:
     DataFrame.astype
     DataFrame.cache
     DataFrame.categorize
-    DataFrame.column_info
     DataFrame.columns
     DataFrame.compute
     DataFrame.corr
@@ -33,10 +32,9 @@ Top level user functions:
     DataFrame.dtypes
     DataFrame.fillna
     DataFrame.floordiv
-    DataFrame.get_division
+    DataFrame.get_partition
     DataFrame.groupby
     DataFrame.head
-    DataFrame.iloc
     DataFrame.index
     DataFrame.iterrows
     DataFrame.itertuples
@@ -77,7 +75,6 @@ Top level user functions:
     DataFrame.sum
     DataFrame.tail
     DataFrame.to_bag
-    DataFrame.to_castra
     DataFrame.to_csv
     DataFrame.to_hdf
     DataFrame.to_delayed
@@ -91,7 +88,6 @@ Rolling Operations
 
 .. autosummary::
    rolling.rolling_apply
-   rolling.rolling_chunk
    rolling.rolling_count
    rolling.rolling_kurt
    rolling.rolling_max
@@ -111,10 +107,11 @@ Create DataFrames
 .. currentmodule:: dask.dataframe
 
 .. autosummary::
+   read_csv
+   read_table
+   read_hdf
    from_array
    from_bcolz
-   from_castra
-   read_csv
    from_dask_array
    from_delayed
    from_pandas
@@ -167,9 +164,13 @@ Other functions
 .. currentmodule:: dask.dataframe
 
 .. autofunction:: read_csv
+.. autofunction:: read_table
+.. autofunction:: read_hdf
 .. autofunction:: from_array
 .. autofunction:: from_pandas
 .. autofunction:: from_bcolz
+.. autofunction:: from_dask_array
+.. autofunction:: from_delayed
 
 .. currentmodule:: dask.dataframe.rolling
 

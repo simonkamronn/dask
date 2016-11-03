@@ -86,7 +86,7 @@ def test_base_of_reduce_preferred():
                  ('a', 1): 2,
                  ('a', 0): 3,
                  ('b', 0): 4,
-                  'c':     5,
+                 'c': 5,
                  ('b', 1): 6,
                  ('b', 2): 7,
                  ('b', 3): 8}
@@ -106,7 +106,7 @@ def test_deep_bases_win_over_dependents():
        e    d
     """
     dsk = {'a': (f, 'b', 'c', 'd'), 'b': (f, 'd', 'e'), 'c': (f, 'd'), 'd': 1,
-            'e': 2}
+           'e': 2}
 
     o = order(dsk)
     assert o['d'] < o['e']
@@ -131,7 +131,7 @@ def test_prefer_deep():
 
 
 def test_stacklimit():
-    dsk = dict(('x%s' % (i+1), (inc, 'x%s' % i)) for i in range(10000))
+    dsk = dict(('x%s' % (i + 1), (inc, 'x%s' % i)) for i in range(10000))
     dependencies, dependents = get_deps(dsk)
     scores = dict.fromkeys(dsk, 1)
     child_max(dependencies, dependents, scores)

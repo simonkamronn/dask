@@ -25,8 +25,8 @@ def cumdims_label(chunks, const):
      (('n', 0), ('n', 2), ('n', 4), ('n', 5))]
     """
     return [tuple(zip((const,) * (1 + len(bds)),
-                      list(accumulate(add, (0,) + bds))))
-              for bds in chunks ]
+                  list(accumulate(add, (0,) + bds))))
+            for bds in chunks]
 
 
 def _breakpoints(cumold, cumnew):
@@ -76,7 +76,7 @@ def _intersect_1d(breaks):
     ret = [[]]
     for idx in range(1, len(breaks)):
         bi = breaks[idx]
-        lastbi = breaks[idx -1]
+        lastbi = breaks[idx - 1]
         if 'n' in lastbi[0] and bi[1]:
             ret.append([])
         if 'o' in lastbi[0]:
@@ -226,14 +226,12 @@ def rechunk(x, chunks):
             slic = [[s[1] for s in ind_slics] for i in range(ndim)]
             ind_in_blk = next(inds_in_block)
             temp = rec_cat_arg
-            for i in range(ndim -1):
+            for i in range(ndim - 1):
                 temp = getitem(temp, ind_in_blk[i])
             for ind, slc in zip(old_inds, slic):
-                name = (('rechunk-split-' + token,)
-                        + tuple(ind)
-                        + sum([(s.start, s.stop) for s in slc], ()))
-                intermediates[name] = (getitem, (x.name,) + tuple(ind),
-                                                 tuple(slc))
+                name = (('rechunk-split-' + token, ) + tuple(ind) +
+                        sum([(s.start, s.stop) for s in slc], ()))
+                intermediates[name] = (getitem, (x.name,) + tuple(ind), tuple(slc))
                 temp[ind_in_blk[-1]] = name
         x2[key] = (concatenate3, rec_cat_arg)
     x2 = merge(x.dask, x2, intermediates)

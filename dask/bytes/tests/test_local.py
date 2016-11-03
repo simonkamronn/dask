@@ -15,14 +15,14 @@ from dask.bytes.core import open_text_files, write_bytes
 
 compute = partial(compute, get=get)
 
-files = {'.test.accounts.1.json':  (b'{"amount": 100, "name": "Alice"}\n'
-                              b'{"amount": 200, "name": "Bob"}\n'
-                              b'{"amount": 300, "name": "Charlie"}\n'
-                              b'{"amount": 400, "name": "Dennis"}\n'),
-         '.test.accounts.2.json':  (b'{"amount": 500, "name": "Alice"}\n'
-                              b'{"amount": 600, "name": "Bob"}\n'
-                              b'{"amount": 700, "name": "Charlie"}\n'
-                              b'{"amount": 800, "name": "Dennis"}\n')}
+files = {'.test.accounts.1.json': (b'{"amount": 100, "name": "Alice"}\n'
+                                   b'{"amount": 200, "name": "Bob"}\n'
+                                   b'{"amount": 300, "name": "Charlie"}\n'
+                                   b'{"amount": 400, "name": "Dennis"}\n'),
+         '.test.accounts.2.json': (b'{"amount": 500, "name": "Alice"}\n'
+                                   b'{"amount": 600, "name": "Bob"}\n'
+                                   b'{"amount": 700, "name": "Charlie"}\n'
+                                   b'{"amount": 800, "name": "Dennis"}\n')}
 
 
 def test_read_bytes():
@@ -30,6 +30,7 @@ def test_read_bytes():
         sample, values = read_bytes('.test.accounts.*')
         assert isinstance(sample, bytes)
         assert sample[:5] == files[sorted(files)[0]][:5]
+        assert sample.endswith(b'\n')
 
         assert isinstance(values, (list, tuple))
         assert isinstance(values[0], (list, tuple))
@@ -38,6 +39,19 @@ def test_read_bytes():
         assert sum(map(len, values)) >= len(files)
         results = compute(*concat(values))
         assert set(results) == set(files.values())
+
+
+def test_read_bytes_sample_delimiter():
+    with filetexts(files, mode='b'):
+        sample, values = read_bytes('.test.accounts.*',
+                                    sample=80, delimiter=b'\n')
+        assert sample.endswith(b'\n')
+        sample, values = read_bytes('.test.accounts.1.json',
+                                    sample=80, delimiter=b'\n')
+        assert sample.endswith(b'\n')
+        sample, values = read_bytes('.test.accounts.1.json',
+                                    sample=2, delimiter=b'\n')
+        assert sample.endswith(b'\n')
 
 
 def test_read_bytes_blocksize_none():
@@ -66,7 +80,7 @@ def test_read_bytes_delimited():
     with filetexts(files, mode='b'):
         for bs in [5, 15, 45, 1500]:
             _, values = read_bytes('.test.accounts*',
-                                    blocksize=bs, delimiter=b'\n')
+                                   blocksize=bs, delimiter=b'\n')
             _, values2 = read_bytes('.test.accounts*',
                                     blocksize=bs, delimiter=b'foo')
             assert ([a.key for a in concat(values)] !=
@@ -101,8 +115,10 @@ def test_compression(fmt, blocksize):
     files2 = valmap(compress, files)
     with filetexts(files2, mode='b'):
         sample, values = read_bytes('.test.accounts.*.json',
-                blocksize=blocksize, delimiter=b'\n', compression=fmt)
+                                    blocksize=blocksize, delimiter=b'\n',
+                                    compression=fmt)
         assert sample[:5] == files[sorted(files)[0]][:5]
+        assert sample.endswith(b'\n')
 
         results = compute(*concat(values))
         assert (b''.join(results) ==
@@ -179,6 +195,7 @@ def test_bad_compression():
             with pytest.raises(ValueError):
                 sample, values = func('.test.accounts.*',
                                       compression='not-found')
+
 
 def test_not_found():
     fn = 'not-a-file'

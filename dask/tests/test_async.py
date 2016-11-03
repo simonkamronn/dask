@@ -77,23 +77,22 @@ def test_finish_task():
     state['cache']['z'] = result
     finish_task(dsk, task, state, set(), sortkey)
 
-    assert state == {
-          'cache': {'y': 2, 'z': 2},
-          'dependencies': {'w': set(['y', 'z']),
-                           'x': set([]),
-                           'y': set([]),
-                           'z': set(['x'])},
-          'finished': set(['z']),
-          'released': set(['x']),
-          'running': set(['other-task']),
-          'dependents': {'w': set([]),
-                         'x': set(['z']),
-                         'y': set(['w']),
-                         'z': set(['w'])},
-          'ready': ['w'],
-          'waiting': {},
-          'waiting_data': {'y': set(['w']),
-                           'z': set(['w'])}}
+    assert state == {'cache': {'y': 2, 'z': 2},
+                     'dependencies': {'w': set(['y', 'z']),
+                                      'x': set([]),
+                                      'y': set([]),
+                                      'z': set(['x'])},
+                     'finished': set(['z']),
+                     'released': set(['x']),
+                     'running': set(['other-task']),
+                     'dependents': {'w': set([]),
+                                    'x': set(['z']),
+                                    'y': set(['w']),
+                                    'z': set(['w'])},
+                     'ready': ['w'],
+                     'waiting': {},
+                     'waiting_data': {'y': set(['w']),
+                                      'z': set(['w'])}}
 
 
 class TestGetAsync(GetFunctionTestMixin):
@@ -109,6 +108,7 @@ def test_cache_options():
     except ImportError:
         return
     cache = Chest()
+
     def inc2(x):
         assert 'y' in cache
         return x + 1
@@ -194,6 +194,7 @@ def test_remote_exception():
 
 def test_ordering():
     L = []
+
     def append(i):
         L.append(i)
 

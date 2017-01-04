@@ -1,45 +1,121 @@
 Changelog
 =========
 
-Development
------------
+0.13.0 / ?
+
+Array
++++++
+
+- Mandatory dtypes on dask.array.  All operations maintain dtype information
+  and UDF functions like map_blocks now require a dtype= keyword if it can not
+  be inferred.  (:pr:`1755`)
+- Support arrays without known shapes, such as arises when slicing arrays with
+  arrays or converting dataframes to arrays (:pr:`1838`)
+- Support mutation by setting one array with another (:pr:`1840`)
+- Tree reductions for covariance and correlations.  (:pr:`1758`)
+- Add SerializableLock for better use with distributed scheduling (:pr:`1766`)
+- Improved atop support (:pr:`1800`)
+- Rechunk optimization (:pr:`1737`), (:pr:`1827`)
+
+Bag
++++
+
+- Avoid wrong results when recomputing the same groupby twice (:pr:`1867`)
+
+DataFrame
++++++++++
+
+- Add ``map_overlap`` for custom rolling operations (:pr:`1769`)
+- Add ``shift`` (:pr:`1773`)
+- Add Parquet support (:pr:`1782`) (:pr:`1792`) (:pr:`1810`), (:pr:`1843`),
+  (:pr:`1859`), (:pr:`1863`)
+- Add missing methods combine, abs, autocorr, sem, nsmallest, first, last,
+  prod, (:pr:`1787`)
+- Approximate nunique (:pr:`1807`), (:pr:`1824`)
+- Reductions with multiple output partitions (for operations like
+  drop_duplicates) (:pr:`1808`), (:pr:`1823`) (:pr:`1828`)
+- Add delitem and copy to DataFrames, increasing mutation support (:pr:`1858`)
+
+
+Core
+++++
+
+- Refactor core byte ingest (:pr:`1768`), (:pr:`1774`)
+- Improve import time (:pr:`1833`)
+
+
+0.12.0 / 2016-11-03
+-------------------
 
 DataFrame
 +++++++++
 - Return a series when functions given to ``dataframe.map_partitions`` return
-  scalars (:pr:`1514`)
+  scalars (:pr:`1515`)
 - Fix type size inference for series (:pr:`1513`)
 - ``dataframe.DataFrame.categorize`` no longer includes missing values
-  in the ``categories``. This is for compatibility with a `pandas change<https://github.com/pydata/pandas/pull/10929>` (:pr:`1565`)
+  in the ``categories``. This is for compatibility with a `pandas change <https://github.com/pydata/pandas/pull/10929>`_ (:pr:`1565`)
 - Fix head parser error in ``dataframe.read_csv`` when some lines have quotes
   (:pr:`1495`)
 - Add ``dataframe.reduction`` and ``series.reduction`` methods to apply generic
   row-wise reduction to dataframes and series (:pr:`1483`)
-- Add ``dataframe.select_dtypes``, which mirrors the `pandas method<http://pandas.pydata.org/pandas-docs/version/0.18.1/generated/pandas.DataFrame.select_dtypes.html>`_ (:pr:`1556`)
+- Add ``dataframe.select_dtypes``, which mirrors the `pandas method <http://pandas.pydata.org/pandas-docs/version/0.18.1/generated/pandas.DataFrame.select_dtypes.html>`_ (:pr:`1556`)
 - ``dataframe.read_hdf`` now supports reading ``Series`` (:pr:`1564`)
+- Support Pandas 0.19.0 (:pr:`1540`)
+- Implement ``select_dtypes`` (:pr:`1556`)
+- String accessor works with indexes (:pr:`1561`)
+- Add pipe method to dask.dataframe (:pr:`1567`)
+- Add ``indicator`` keyword to merge (:pr:`1575`)
+- Support Series in ``read_hdf`` (:pr:`1575`)
+- Support Categories with missing values (:pr:`1578`)
+- Support inplace operators like ``df.x += 1`` (:pr:`1585`)
+- Str accessor passes through args and kwargs (:pr:`1621`)
+- Improved groupby support for single-machine multiprocessing scheduler
+  (:pr:`1625`)
+- Tree reductions (:pr:`1663`)
+- Pivot tables (:pr:`1665`)
+- Add clip (:pr:`1667`), align (:pr:`1668`), combine_first (:pr:`1725`), and
+  any/all (:pr:`1724`)
+- Improved handling of divisions on dask-pandas merges (:pr:`1666`)
+- Add ``groupby.aggregate`` method (:pr:`1678`)
+- Add ``dd.read_table`` function (:pr:`1682`)
+- Improve support for multi-level columns (:pr:`1697`) (:pr:`1712`)
+- Support 2d indexing in ``loc`` (:pr:`1726`)
+- Extend ``resample`` to include DataFrames (:pr:`1741`)
+- Support dask.array ufuncs on dask.dataframe objects (:pr:`1669`)
 
-Distributed
-+++++++++++
-
-- Create new threadpool when operating from thread (:pr:`1487`)
 
 Array
 +++++
 - Add information about how ``dask.array`` ``chunks`` argument work (:pr:`1504`)
 - Fix field access with non-scalar fields in ``dask.array`` (:pr:`1484`)
 - Add concatenate= keyword to atop to concatenate chunks of contracted dimensions
-- Add new_axes= keyword to atop to support adding new dimensions
+- Optimized slicing performance (:pr:`1539`) (:pr:`1731`)
+- Extend ``atop`` with a ``concatenate=`` (:pr:`1609`) ``new_axes=``
+  (:pr:`1612`) and ``adjust_chunks=`` (:pr:`1716`) keywords
+- Add clip (:pr:`1610`) swapaxes (:pr:`1611`) round (:pr:`1708`) repeat
+- Automatically align chunks in ``atop``-backed operations (:pr:`1644`)
+- Cull dask.arrays on slicing (:pr:`1709`)
 
 Bag
 ++++
 - Fix issue with callables in ``bag.from_sequence`` being interpreted as
   tasks (:pr:`1491`)
+- Avoid non-lazy memory use in reductions (:pr:`1747`)
 
-Documentation
-+++++++++++++
+Administration
+++++++++++++++
 
 - Added changelog (:pr:`1526`)
+- Create new threadpool when operating from thread (:pr:`1487`)
 - Unify example documentation pages into one (:pr:`1520`)
+- Add versioneer for git-commit based versions (:pr:`1569`)
+- Pass through node_attr and edge_attr keywords in dot visualization
+  (:pr:`1614`)
+- Add continuous testing for Windows with Appveyor (:pr:`1648`)
+- Remove use of multiprocessing.Manager (:pr:`1653`)
+- Add global optimizations keyword to compute (:pr:`1675`)
+- Micro-optimize get_dependencies (:pr:`1722`)
+
 
 
 0.11.0 / 2016-08-24
@@ -212,8 +288,7 @@ Array
 +++++
 
 - Bugfix for range slicing that could periodically lead to incorrect results.
-- Improved support and resiliency of ``arg`` reductions (``argmin``,
-``argmax``, etc.)
+- Improved support and resiliency of ``arg`` reductions (``argmin``, ``argmax``, etc.)
 
 Bag
 ++++

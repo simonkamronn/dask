@@ -6,10 +6,10 @@ import versioneer
 
 extras_require = {
   'array': ['numpy', 'toolz >= 0.7.2'],
-  'bag': ['cloudpickle >= 0.2.1', 'toolz >= 0.7.2', 'partd >= 0.3.5'],
+  'bag': ['cloudpickle >= 0.2.1', 'toolz >= 0.7.2', 'partd >= 0.3.7'],
   'dataframe': ['numpy', 'pandas >= 0.18.0', 'toolz >= 0.7.2',
-                'partd >= 0.3.5', 'cloudpickle >= 0.2.1'],
-  'distributed': ['distributed >= 1.10', 's3fs'],
+                'partd >= 0.3.7', 'cloudpickle >= 0.2.1'],
+  'distributed': ['distributed >= 1.15', 's3fs >= 0.0.8'],
   'imperative': ['toolz >= 0.7.2'],
 }
 extras_require['complete'] = sorted(set(sum(extras_require.values(), [])))
@@ -24,12 +24,12 @@ tests = [p + '.tests' for p in packages]
 setup(name='dask',
       version=versioneer.get_version(),
       cmdclass=versioneer.get_cmdclass(),
-      description='Minimal task scheduling abstraction',
+      description='Parallel PyData with Task Scheduling',
       url='http://github.com/dask/dask/',
       maintainer='Matthew Rocklin',
       maintainer_email='mrocklin@gmail.com',
       license='BSD',
-      keywords='task-scheduling parallelism',
+      keywords='task-scheduling parallel numpy pandas pydata',
       packages=packages + tests,
       long_description=(open('README.rst').read() if exists('README.rst')
                         else ''),

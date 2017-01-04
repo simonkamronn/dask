@@ -615,7 +615,12 @@ def from_delayed(dfs, meta=None, divisions=None, prefix='from-delayed',
     else:
         Frame = DataFrame
 
-    df = Frame(dsk3, name, meta, [None] * (len(dfs) + 1))
+    if isinstance(divisions, (tuple, list)):
+        _divisions = divisions
+    else:
+        _divisions = [None] * (len(dfs) + 1)
+
+    df = Frame(dsk3, name, meta, _divisions)
 
     if divisions == 'sorted':
         from ..core import compute_divisions

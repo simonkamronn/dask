@@ -23,8 +23,8 @@ from ..utils import derived_from, M, funcname
 #
 # Dask groupby supports reductions, i.e., mean, sum and alike, and apply. The
 # former do not shuffle the data and are efficiently implemented as tree
-# reductions. The latter is implemented by shuffling the underlying partiitons
-# such that all items of a group can be found in the same parititon.
+# reductions. The latter is implemented by shuffling the underlying partitions
+# such that all items of a group can be found in the same partition.
 #
 # The argument to ``.groupby``, the index, can be a ``str``, ``dd.DataFrame``,
 # ``dd.Series``, or a list thereof. In operations on the grouped object, the
@@ -33,13 +33,13 @@ from ..utils import derived_from, M, funcname
 # groupby operation. Therefore, the alignment has to be guaranteed by the
 # caller.
 #
-# To operate on matchings paritions, most groupby operations exploit the
+# To operate on matching partitions, most groupby operations exploit the
 # corresponding support in ``apply_concat_apply``. Specifically, this function
-# operates on matching paritiotns of frame-like objects passed as varargs.
+# operates on matching partitions of frame-like objects passed as varargs.
 #
 # After the inital chunk step, the passed index is implicitly passed along to
-# subsequent operations as the index of the parittions. Groupby operations on
-# the individual parttions can then access the index via the ``levels``
+# subsequent operations as the index of the partitions. Groupby operations on
+# the individual partitions can then access the index via the ``levels``
 # parameter of the ``groupby`` function. The correct arguments is determined by
 # the ``_determine_levels`` function.
 #

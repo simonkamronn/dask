@@ -171,8 +171,8 @@ def to_textfiles(b, path, name_function=None, compression='infer',
     out = write_bytes(b.to_delayed(), path, name_function, compression,
                       encoding=encoding)
     if compute:
-        from dask import compute
-        compute(*out)
+        from dask import delayed
+        delayed(out).compute()
     else:
         return out
 
@@ -635,7 +635,6 @@ class Bag(Base):
         Bag.foldby
         """
         combine = combine or binop
-        initial = quote(initial)
         if initial is not no_default:
             return self.reduction(curry(_reduce, binop, initial=initial),
                                   curry(_reduce, combine),

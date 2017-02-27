@@ -3,40 +3,33 @@ from operator import add, setitem
 import pickle
 from random import random
 
-from toolz import identity, partial
+from toolz import identity, partial, merge
 import pytest
 
 from dask.compatibility import PY2, PY3
-from dask.delayed import delayed, to_task_dasks, compute, Delayed
+from dask.delayed import delayed, to_task_dask, compute, Delayed
 
 
-def test_to_task_dasks():
+def test_to_task_dask():
     a = delayed(1, name='a')
     b = delayed(2, name='b')
-    task, dasks = to_task_dasks([a, b, 3])
+    task, dask = to_task_dask([a, b, 3])
     assert task == ['a', 'b', 3]
-    assert len(dasks) == 2
-    assert a.dask in dasks
-    assert b.dask in dasks
 
-    task, dasks = to_task_dasks((a, b, 3))
+    task, dask = to_task_dask((a, b, 3))
     assert task == (tuple, ['a', 'b', 3])
-    assert len(dasks) == 2
-    assert a.dask in dasks
-    assert b.dask in dasks
+    assert dict(dask) == merge(a.dask, b.dask)
 
-    task, dasks = to_task_dasks({a: 1, b: 2})
+    task, dask = to_task_dask({a: 1, b: 2})
     assert (task == (dict, [['b', 2], ['a', 1]]) or
             task == (dict, [['a', 1], ['b', 2]]))
-    assert len(dasks) == 2
-    assert a.dask in dasks
-    assert b.dask in dasks
+    assert dict(dask) == merge(a.dask, b.dask)
 
     f = namedtuple('f', ['x', 'y'])
     x = f(1, 2)
-    task, dasks = to_task_dasks(x)
+    task, dask = to_task_dask(x)
     assert task == x
-    assert dasks == []
+    assert dict(dask) == {}
 
 
 def test_delayed():
@@ -101,15 +94,6 @@ def test_delayed_errors():
     pytest.raises(AttributeError, lambda: a._hidden())
     # Truth of delayed forbidden
     pytest.raises(TypeError, lambda: bool(a))
-
-
-def test_compute():
-    a = delayed(1) + 5
-    b = a + 1
-    c = a + 2
-    assert compute(b, c) == (7, 8)
-    assert compute(b) == (7,)
-    assert compute([a, b], c) == ([6, 7], 8)
 
 
 def test_common_subexpressions():
@@ -282,13 +266,15 @@ def test_array_delayed():
     assert val.sum().compute() == (arr + arr + 1).sum()
     assert val[0, 0].compute() == (arr + arr + 1)[0, 0]
 
-    task, dasks = to_task_dasks(darr)
-    assert len(dasks) == 1
+    task, dsk = to_task_dask(darr)
     orig = set(darr.dask)
-    final = set(dasks[0])
+    final = set(dsk)
     assert orig.issubset(final)
     diff = final.difference(orig)
     assert len(diff) == 1
+
+    delayed_arr = delayed(darr)
+    assert (delayed_arr.compute() == arr).all()
 
 
 def test_array_bag_delayed():
@@ -372,17 +358,17 @@ def test_name_consitent_across_instances():
 
     data = {'x': 1, 'y': 25, 'z': [1, 2, 3]}
     if PY2:
-        assert func(data)._key == 'identity-777036d61a8334229dc0eda4454830d7'
+        assert func(data)._key == 'identity-6700b857eea9a7d3079762c9a253ffbd'
     if PY3:
-        assert func(data)._key == 'identity-1de4057b4cfa0ba7faed76b9c383cc99'
+        assert func(data)._key == 'identity-84c5e2194036c17d1d97c4e3a2b90482'
 
     data = {'x': 1, 1: 'x'}
     assert func(data)._key == func(data)._key
 
     if PY2:
-        assert func(1)._key == 'identity-d3eda9ebeead15c7e491960e89605b7f'
+        assert func(1)._key == 'identity-91f02358e13dca18cde218a63fee436a'
     if PY3:
-        assert func(1)._key == 'identity-5390b9efe3ddb6ea0557139003eef253'
+        assert func(1)._key == 'identity-7126728842461bf3d2caecf7b954fa3b'
 
 
 def test_sensitive_to_partials():

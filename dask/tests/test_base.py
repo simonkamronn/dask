@@ -7,8 +7,10 @@ import subprocess
 import sys
 
 import dask
+from dask import delayed
 from dask.base import (compute, tokenize, normalize_token, normalize_function,
-                       visualize)
+                       visualize, persist)
+from dask.delayed import Delayed
 from dask.utils import tmpdir, tmpfile, ignoring
 from dask.utils_test import inc, dec
 from dask.compatibility import unicode
@@ -210,6 +212,10 @@ def test_tokenize_dict():
     assert tokenize({'x': 1, 1: 'x'}) == tokenize({'x': 1, 1: 'x'})
 
 
+def test_tokenize_set():
+    assert tokenize({1, 2, 'x', (1, 'x')}) == tokenize({1, 2, 'x', (1, 'x')})
+
+
 def test_tokenize_ordered_dict():
     with ignoring(ImportError):
         from collections import OrderedDict
@@ -219,6 +225,12 @@ def test_tokenize_ordered_dict():
 
         assert tokenize(a) == tokenize(b)
         assert tokenize(a) != tokenize(c)
+
+
+@pytest.mark.skipif('not np')
+def test_tokenize_object_array_with_nans():
+    a = np.array([u'foo', u'Jos\xe9', np.nan], dtype='O')
+    assert tokenize(a) == tokenize(a)
 
 
 @pytest.mark.skipif('not db')
@@ -241,8 +253,11 @@ def test_compute_no_opt():
     keys = []
     with Callback(pretask=lambda key, *args: keys.append(key)):
         o.compute(get=dask.get)
-    assert len([k for k in keys if 'mul' in k[0]]) == 4
-    assert len([k for k in keys if 'add' in k[0]]) == 0
+    # Names of fused tasks have been merged, and the original key is an alias.
+    # Otherwise, the lengths below would be 4 and 0.
+    assert len([k for k in keys if 'mul' in k[0]]) == 8
+    assert len([k for k in keys if 'add' in k[0]]) == 4
+    assert len([k for k in keys if 'add-map-mul' in k[0]]) == 4  # See? Renamed
 
 
 @pytest.mark.skipif('not da')
@@ -254,6 +269,19 @@ def test_compute_array():
     out1, out2 = compute(darr1, darr2)
     assert np.allclose(out1, arr + 1)
     assert np.allclose(out2, arr + 2)
+
+
+@pytest.mark.skipif('not da')
+def test_persist_array():
+    from dask.array.utils import assert_eq
+    arr = np.arange(100).reshape((10, 10))
+    x = da.from_array(arr, chunks=(5, 5))
+    x = (x + 1) - x.mean(axis=0)
+    y = x.persist()
+
+    assert_eq(x, y)
+    assert set(y.dask).issubset(x.dask)
+    assert len(y.dask) == y.npartitions
 
 
 @pytest.mark.skipif('not dd')
@@ -300,6 +328,19 @@ def test_compute_with_literal():
     assert yy == y
 
     assert compute(5) == (5,)
+
+
+def test_compute_nested():
+    a = delayed(1) + 5
+    b = a + 1
+    c = a + 2
+    assert (compute({'a': a, 'b': [1, 2, b]}, (c, 2)) ==
+            ({'a': 6, 'b': [1, 2, 7]}, (8, 2)))
+
+    res = compute([a, b], c, traverse=False)
+    assert res[0][0] is a
+    assert res[0][1] is b
+    assert res[1] == 8
 
 
 @pytest.mark.skipif('not da')
@@ -371,3 +412,42 @@ def test_default_imports():
                  'partd', 's3fs', 'distributed']
     for mod in blacklist:
         assert mod not in modules
+
+
+def test_persist_literals():
+    assert persist(1, 2, 3) == (1, 2, 3)
+
+
+def test_persist_delayed():
+    x1 = delayed(1)
+    x2 = delayed(inc)(x1)
+    x3 = delayed(inc)(x2)
+
+    xx, = persist(x3)
+    assert isinstance(xx, Delayed)
+    assert xx.key == x3.key
+    assert len(xx.dask) == 1
+
+    assert x3.compute() == xx.compute()
+
+
+@pytest.mark.skipif('not da or not db')
+def test_persist_array_bag():
+    x = da.arange(5, chunks=2) + 1
+    b = db.from_sequence([1, 2, 3]).map(inc)
+
+    with pytest.raises(ValueError):
+        persist(x, b)
+
+    xx, bb = persist(x, b, get=dask.async.get_sync)
+
+    assert isinstance(xx, da.Array)
+    assert isinstance(bb, db.Bag)
+
+    assert xx.name == x.name
+    assert bb.name == b.name
+    assert len(xx.dask) == xx.npartitions < len(x.dask)
+    assert len(bb.dask) == bb.npartitions < len(b.dask)
+
+    assert np.allclose(x, xx)
+    assert list(b) == list(bb)

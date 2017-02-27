@@ -198,6 +198,8 @@ def test_distinct():
     assert b.distinct().name == b.distinct().name
     assert 'distinct' in b.distinct().name
     assert b.distinct().count().compute() == 5
+    bag = db.from_sequence([0] * 50, npartitions=50)
+    assert bag.filter(None).distinct().compute() == []
 
 
 def test_frequencies():
@@ -208,6 +210,14 @@ def test_frequencies():
     assert c.name == b.frequencies().name
     assert c.name != c2.name
     assert c2.name == b.frequencies(split_every=2).name
+    # test bag with empty partitions
+    b2 = db.from_sequence(range(20), partition_size=2)
+    b2 = b2.filter(lambda x: x < 10)
+    d = b2.frequencies()
+    assert dict(d) == dict(zip(range(10), [1] * 10))
+    bag = db.from_sequence([0, 0, 0, 0], npartitions=4)
+    bag2 = bag.filter(None).frequencies(split_every=2)
+    assert dict(bag2.compute(get=dask.get)) == {}
 
 
 def test_topk():
@@ -418,7 +428,7 @@ def test_inline_singleton_lists():
     assert inline_singleton_lists(inp) == out
 
     out = {'c': (f, 'a', 1)}
-    assert optimize(inp, ['c']) == out
+    assert optimize(inp, ['c'], rename_fused_keys=False) == out
 
     inp = {'b': (list, 'a'),
            'c': (f, 'b', 1),
@@ -898,6 +908,22 @@ def test_from_delayed():
     assert asum_value.compute() == asum_item.compute() == 6
 
 
+def test_from_delayed_iterator():
+    from dask.delayed import delayed
+
+    def lazy_records(n):
+        return ({'operations': [1, 2]} for _ in range(n))
+
+    delayed_records = delayed(lazy_records, pure=False)
+    bag = db.from_delayed([delayed_records(5) for _ in range(5)])
+    assert db.compute(
+        bag.count(),
+        bag.pluck('operations').count(),
+        bag.pluck('operations').concat().count(),
+        get=dask.get,
+    ) == (25, 25, 50)
+
+
 def test_range():
     for npartitions in [1, 7, 10, 28]:
         b = db.range(100, npartitions=npartitions)
@@ -915,19 +941,29 @@ def test_zip(npartitions, hi=1000):
     assert list(pairs) == list(zip(range(0, hi, 2), range(1, hi, 2)))
 
 
-def test_repartition():
-    for x, y in [(10, 5), (7, 3), (5, 1), (5, 4)]:
-        b = db.from_sequence(range(20), npartitions=x)
-        c = b.repartition(y)
+@pytest.mark.parametrize('nin', [1, 2, 7, 11, 23])
+@pytest.mark.parametrize('nout', [1, 2, 5, 12, 23])
+def test_repartition(nin, nout):
+    b = db.from_sequence(range(100), npartitions=nin)
+    c = b.repartition(npartitions=nout)
 
-        assert b.npartitions == x
-        assert c.npartitions == y
-        assert list(b) == c.compute(get=dask.get)
+    assert c.npartitions == nout
+    assert b.compute(get=dask.get) == c.compute(get=dask.get)
+    results = dask.get(c.dask, c._keys())
+    assert all(results)
 
-    try:
-        b.repartition(100)
-    except NotImplementedError as e:
-        assert '100' in str(e)
+
+def test_repartition_names():
+    b = db.from_sequence(range(100), npartitions=5)
+    c = b.repartition(2)
+    assert b.name != c.name
+
+    d = b.repartition(20)
+    assert b.name != c.name
+    assert c.name != d.name
+
+    c = b.repartition(5)
+    assert b is c
 
 
 @pytest.mark.skipif('not db.core._implement_accumulate')
@@ -1016,6 +1052,16 @@ def test_reduction_empty():
     b = db.from_sequence(range(10), npartitions=100)
     assert b.filter(lambda x: x % 2 == 0).max().compute(get=dask.get) == 8
     assert b.filter(lambda x: x % 2 == 0).min().compute(get=dask.get) == 0
+
+
+def test_reduction_empty_aggregate():
+    b = db.from_sequence([0, 0, 0, 1], npartitions=4).filter(None)
+    assert b.min(split_every=2).compute(get=dask.get) == 1
+    vals = db.compute(b.min(split_every=2), b.max(split_every=2), get=dask.get)
+    assert vals == (1, 1)
+    with pytest.raises(ValueError):
+        b = db.from_sequence([0, 0, 0, 0], npartitions=4)
+        b.filter(None).min(split_every=2).compute(get=dask.get)
 
 
 class StrictReal(int):

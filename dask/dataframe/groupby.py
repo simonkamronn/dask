@@ -8,8 +8,8 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from .core import (DataFrame, Series, aca, map_partitions, no_default,
-                   split_out_on_index)
+from .core import (DataFrame, Series, aca, map_partitions, merge,
+                   new_dd_object, no_default, split_out_on_index)
 from .methods import drop_columns
 from .shuffle import shuffle
 from .utils import make_meta, insert_meta_param_description, raise_on_meta_error
@@ -69,7 +69,7 @@ def _normalize_index(df, index):
 
     elif (isinstance(index, Series) and index.name in df.columns and
           index._name == df[index.name]._name):
-            return index.name
+        return index.name
 
     elif (isinstance(index, DataFrame) and
           set(index.columns).issubset(df.columns) and
@@ -92,7 +92,50 @@ def _maybe_slice(grouped, columns):
     return grouped
 
 
+def _is_aligned(df, by):
+    """Check if `df` and `by` have aligned indices"""
+    if isinstance(by, (pd.Series, pd.DataFrame)):
+        return df.index.equals(by.index)
+    elif isinstance(by, (list, tuple)):
+        return all(_is_aligned(df, i) for i in by)
+    else:
+        return True
+
+
+def _groupby_raise_unaligned(df, **kwargs):
+    """Groupby, but raise if df and `by` key are unaligned.
+
+    Pandas supports grouping by a column that doesn't align with the input
+    frame/series/index. However, the reindexing this causes doesn't seem to be
+    threadsafe, and can result in incorrect results. Since grouping by an
+    unaligned key is generally a bad idea, we just error loudly in dask.
+
+    For more information see pandas GH issue #15244 and Dask GH issue #1876."""
+    by = kwargs.get('by', None)
+    if by is not None and not _is_aligned(df, by):
+        msg = ("Grouping by an unaligned index is unsafe and unsupported.\n"
+               "This can be caused by filtering only one of the object or\n"
+               "grouping key. For example, the following works in pandas,\n"
+               "but not in dask:\n"
+               "\n"
+               "df[df.foo < 0].groupby(df.bar)\n"
+               "\n"
+               "This can be avoided by either filtering beforehand, or\n"
+               "passing in the name of the column instead:\n"
+               "\n"
+               "df2 = df[df.foo < 0]\n"
+               "df2.groupby(df2.bar)\n"
+               "# or\n"
+               "df[df.foo < 0].groupby('bar')\n"
+               "\n"
+               "For more information see dask GH issue #1876.")
+        raise ValueError(msg)
+    return df.groupby(**kwargs)
+
+
 def _groupby_slice_apply(df, grouper, key, func):
+    # No need to use raise if unaligned here - this is only called after
+    # shuffling, which makes everything aligned already
     g = df.groupby(grouper)
     if key:
         g = g[key]
@@ -101,7 +144,7 @@ def _groupby_slice_apply(df, grouper, key, func):
 
 def _groupby_get_group(df, by_key, get_key, columns):
     # SeriesGroupBy may pass df which includes group key
-    grouped = df.groupby(by_key)
+    grouped = _groupby_raise_unaligned(df, by=by_key)
 
     if get_key in grouped.groups:
         if isinstance(df, pd.DataFrame):
@@ -126,21 +169,23 @@ def _groupby_aggregate(df, aggfunc=None, levels=None):
 
 
 def _apply_chunk(df, *index, **kwargs):
-    func = kwargs.pop('func')
+    func = kwargs.pop('chunk')
     columns = kwargs.pop('columns')
 
+    g = _groupby_raise_unaligned(df, by=index)
+
     if isinstance(df, pd.Series) or columns is None:
-        return func(df.groupby(index))
+        return func(g)
     else:
         if isinstance(columns, (tuple, list, set, pd.Index)):
             columns = list(columns)
-        return func(df.groupby(index)[columns])
+        return func(g[columns])
 
 
 def _var_chunk(df, *index):
     if isinstance(df, pd.Series):
         df = df.to_frame()
-    g = df.groupby(index)
+    g = _groupby_raise_unaligned(df, by=index)
     x = g.sum()
     x2 = g.agg(lambda x: (x**2).sum()).rename(columns=lambda c: c + '-x2')
     n = g.count().rename(columns=lambda c: c + '-count')
@@ -176,10 +221,11 @@ def _nunique_df_chunk(df, *index, **kwargs):
     levels = kwargs.pop('levels')
     name = kwargs.pop('name')
 
-    # we call set_index here to force a possibly duplicate index
-    # for our reduce step
-    grouped = df.groupby(index)[[name]].apply(pd.DataFrame.drop_duplicates)
+    g = _groupby_raise_unaligned(df, by=index)
+    grouped = g[[name]].apply(pd.DataFrame.drop_duplicates)
 
+    # we set the index here to force a possibly duplicate index
+    # for our reduce step
     if isinstance(levels, list):
         grouped.index = pd.MultiIndex.from_arrays([
             grouped.index.get_level_values(level=level) for level in levels
@@ -478,7 +524,7 @@ def _groupby_apply_funcs(df, *index, **kwargs):
         kwargs.update(by=list(index))
 
     funcs = kwargs.pop('funcs')
-    grouped = df.groupby(**kwargs)
+    grouped = _groupby_raise_unaligned(df, **kwargs)
 
     result = collections.OrderedDict()
     for result_column, func, func_kwargs in funcs:
@@ -530,6 +576,22 @@ def _finalize_std(df, count_column, sum_column, sum2_column, ddof=1):
     return np.sqrt(result)
 
 
+def _cum_agg_aligned(part, cum_last, index, columns, func, initial):
+    align = cum_last.reindex(part.set_index(index).index, fill_value=initial)
+    align.index = part.index
+    return func(part[columns], align)
+
+
+def _cum_agg_filled(a, b, func, initial):
+    union = a.index.union(b.index)
+    return func(a.reindex(union, fill_value=initial),
+                b.reindex(union, fill_value=initial), fill_value=initial)
+
+
+def _cumcount_aggregate(a, b, fill_value=None):
+    return a.add(b, fill_value=fill_value) + 1
+
+
 class _GroupBy(object):
     """ Superclass for DataFrameGroupBy and SeriesGroupBy
 
@@ -538,17 +600,17 @@ class _GroupBy(object):
 
     obj: DataFrame or Series
         DataFrame or Series to be grouped
-    index: str, list or Series
+    by: str, list or Series
         The key for grouping
-    kwargs: dict
-        Other keywords passed to groupby
+    slice: str, list
+        The slice keys applied to GroupBy result
     """
-    def __init__(self, df, index=None, slice=None, **kwargs):
+    def __init__(self, df, by=None, slice=None):
+
         assert isinstance(df, (DataFrame, Series))
         self.obj = df
-
         # grouping key passed via groupby method
-        self.index = _normalize_index(df, index)
+        self.index = _normalize_index(df, by)
 
         if isinstance(self.index, list):
             do_index_partition_align = all(
@@ -566,7 +628,6 @@ class _GroupBy(object):
 
         # slicing key applied to _GroupBy instance
         self._slice = slice
-        self.kwargs = kwargs
 
         if isinstance(self.index, list):
             index_meta = [item._meta if isinstance(item, Series) else item for item in self.index]
@@ -598,7 +659,8 @@ class _GroupBy(object):
         grouped = sample.groupby(index_meta)
         return _maybe_slice(grouped, self._slice)
 
-    def _aca_agg(self, token, func, aggfunc=None, split_every=None, split_out=1):
+    def _aca_agg(self, token, func, aggfunc=None, split_every=None,
+                 split_out=1):
         if aggfunc is None:
             aggfunc = func
 
@@ -610,11 +672,87 @@ class _GroupBy(object):
 
         return aca([self.obj, self.index] if not isinstance(self.index, list) else [self.obj] + self.index,
                    chunk=_apply_chunk,
-                   chunk_kwargs=dict(func=func, columns=columns),
+                   chunk_kwargs=dict(chunk=func, columns=columns),
                    aggregate=_groupby_aggregate,
                    meta=meta, token=token, split_every=split_every,
                    aggregate_kwargs=dict(aggfunc=aggfunc, levels=levels),
                    split_out=split_out, split_out_setup=split_out_on_index)
+
+    def _cum_agg(self, token, chunk, aggregate, initial):
+        """ Wrapper for cumulative groupby operation """
+        meta = chunk(self._meta)
+        columns = meta.name if isinstance(meta, pd.Series) else meta.columns
+        index = self.index if isinstance(self.index, list) else [self.index]
+
+        name = self._token_prefix + token
+        name_part = name + '-map'
+        name_last = name + '-take-last'
+        name_cum = name + '-cum-last'
+
+        # cumulate each partitions
+        cumpart_raw = map_partitions(_apply_chunk, self.obj, *index,
+                                     chunk=chunk,
+                                     columns=columns,
+                                     token=name_part,
+                                     meta=meta)
+        cumpart_ext = (cumpart_raw.to_frame()
+                       if isinstance(meta, pd.Series)
+                       else cumpart_raw).assign(**{i: self.obj[i]
+                                                   for i in index})
+
+        cumlast = map_partitions(_apply_chunk, cumpart_ext, *index,
+                                 columns=0 if columns is None else columns,
+                                 chunk=M.last,
+                                 meta=meta,
+                                 token=name_last)
+
+        # aggregate cumulated partisions and its previous last element
+        dask = {}
+        dask[(name, 0)] = (cumpart_raw._name, 0)
+
+        for i in range(1, self.obj.npartitions):
+            # store each cumulative step to graph to reduce computation
+            if i == 1:
+                dask[(name_cum, i)] = (cumlast._name, i - 1)
+            else:
+                # aggregate with previous cumulation results
+                dask[(name_cum, i)] = (_cum_agg_filled,
+                                       (name_cum, i - 1),
+                                       (cumlast._name, i - 1),
+                                       aggregate, initial)
+            dask[(name, i)] = (_cum_agg_aligned,
+                               (cumpart_ext._name, i), (name_cum, i),
+                               index, 0 if columns is None else columns,
+                               aggregate, initial)
+        return new_dd_object(merge(dask, cumpart_ext.dask, cumlast.dask),
+                             name, chunk(self._meta), self.obj.divisions)
+
+    @derived_from(pd.core.groupby.GroupBy)
+    def cumsum(self, axis=0):
+        if axis:
+            return self.obj.cumsum(axis=axis)
+        else:
+            return self._cum_agg('cumsum',
+                                 chunk=M.cumsum,
+                                 aggregate=M.add,
+                                 initial=0)
+
+    @derived_from(pd.core.groupby.GroupBy)
+    def cumprod(self, axis=0):
+        if axis:
+            return self.obj.cumprod(axis=axis)
+        else:
+            return self._cum_agg('cumprod',
+                                 chunk=M.cumprod,
+                                 aggregate=M.mul,
+                                 initial=1)
+
+    @derived_from(pd.core.groupby.GroupBy)
+    def cumcount(self, axis=None):
+        return self._cum_agg('cumcount',
+                             chunk=M.cumcount,
+                             aggregate=_cumcount_aggregate,
+                             initial=-1)
 
     @derived_from(pd.core.groupby.GroupBy)
     def sum(self, split_every=None, split_out=1):
@@ -807,7 +945,7 @@ class _GroupBy(object):
             df2 = df
             index = df[self.index]
 
-        df3 = shuffle(df2, index, **self.kwargs)  # shuffle dataframe and index
+        df3 = shuffle(df2, index)  # shuffle dataframe and index
 
         if isinstance(self.index, DataFrame):  # extract index from dataframe
             cols = ['_index_' + c for c in self.index.columns]
@@ -840,23 +978,11 @@ class DataFrameGroupBy(_GroupBy):
 
     _token_prefix = 'dataframe-groupby-'
 
-    def __init__(self, df, index=None, slice=None, **kwargs):
-
-        if not kwargs.get('as_index', True):
-            msg = ("The keyword argument `as_index=False` is not supported in "
-                   "dask.dataframe.groupby")
-            raise NotImplementedError(msg)
-
-        super(DataFrameGroupBy, self).__init__(df, index=index,
-                                               slice=slice, **kwargs)
-
     def __getitem__(self, key):
         if isinstance(key, list):
-            g = DataFrameGroupBy(self.obj, index=self.index,
-                                 slice=key, **self.kwargs)
+            g = DataFrameGroupBy(self.obj, by=self.index, slice=key)
         else:
-            g = SeriesGroupBy(self.obj, index=self.index,
-                              slice=key, **self.kwargs)
+            g = SeriesGroupBy(self.obj, by=self.index, slice=key)
 
         # error is raised from pandas
         g._meta = g._meta[key]
@@ -888,25 +1014,25 @@ class SeriesGroupBy(_GroupBy):
 
     _token_prefix = 'series-groupby-'
 
-    def __init__(self, df, index, slice=None, **kwargs):
+    def __init__(self, df, by=None, slice=None):
         # for any non series object, raise pandas-compat error message
+
         if isinstance(df, Series):
-            if isinstance(index, Series):
+            if isinstance(by, Series):
                 pass
-            elif isinstance(index, list):
-                if len(index) == 0:
+            elif isinstance(by, list):
+                if len(by) == 0:
                     raise ValueError("No group keys passed!")
 
-                non_series_items = [item for item in index
+                non_series_items = [item for item in by
                                     if not isinstance(item, Series)]
                 # raise error from pandas, if applicable
                 df._meta.groupby(non_series_items)
             else:
                 # raise error from pandas, if applicable
-                df._meta.groupby(index)
+                df._meta.groupby(by)
 
-        super(SeriesGroupBy, self).__init__(df, index=index,
-                                            slice=slice, **kwargs)
+        super(SeriesGroupBy, self).__init__(df, by=by, slice=slice)
 
     def nunique(self, split_every=None, split_out=1):
         name = self._meta.obj.name

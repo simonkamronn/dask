@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from importlib import import_module
 from threading import Lock
 import multiprocessing as mp
-from .import multiprocessing
+from . import multiprocessing
 import uuid
 from weakref import WeakValueDictionary
 
@@ -25,6 +25,7 @@ from .compatibility import (long, getargspec, BZ2File, GzipFile, LZMAFile, PY3,
                             urlsplit, unicode)
 from .core import get_deps
 from .context import _globals
+from .optimize import key_split    # noqa: F401
 
 
 system_encoding = sys.getdefaultencoding()
@@ -47,6 +48,35 @@ def deepmap(func, *seqs):
         return [deepmap(func, *items) for items in zip(*seqs)]
     else:
         return func(*seqs)
+
+
+def homogeneous_deepmap(func, seq):
+    if not seq:
+        return seq
+    n = 0
+    tmp = seq
+    while isinstance(tmp, list):
+        n += 1
+        tmp = tmp[0]
+
+    return ndeepmap(n, func, seq)
+
+
+def ndeepmap(n, func, seq):
+    """ Call a function on every element within a nested container
+
+    >>> def inc(x):
+    ...     return x + 1
+    >>> L = [[1, 2], [3, 4, 5]]
+    >>> ndeepmap(2, inc, L)
+    [[2, 3], [4, 5, 6]]
+    """
+    if n == 1:
+        return [func(item) for item in seq]
+    elif n > 1:
+        return [ndeepmap(n - 1, func, item) for item in seq]
+    else:
+        return func(seq)
 
 
 @contextmanager
@@ -800,15 +830,23 @@ def infer_storage_options(urlpath, inherit_storage_options=None):
     "url_query": "q=1", "extra": "value"}
     """
     # Handle Windows paths including disk name in this special case
-    if re.match(r'^[a-zA-Z]:\\', urlpath):
+    if re.match(r'^[a-zA-Z]:[\\/]', urlpath):
         return {'protocol': 'file',
                 'path': urlpath}
 
     parsed_path = urlsplit(urlpath)
+    protocol = parsed_path.scheme or 'file'
+    path = parsed_path.path
+    if protocol == 'file':
+        # Special case parsing file protocol URL on Windows according to:
+        # https://msdn.microsoft.com/en-us/library/jj710207.aspx
+        windows_path = re.match(r'^/([a-zA-Z])[:|]([\\/].*)$', path)
+        if windows_path:
+            path = '%s:%s' % windows_path.groups()
 
     inferred_storage_options = {
-        'protocol': parsed_path.scheme or 'file',
-        'path': parsed_path.path,
+        'protocol': protocol,
+        'path': path,
     }
 
     if parsed_path.netloc:
@@ -872,57 +910,6 @@ def put_lines(buf, lines):
     if any(not isinstance(x, unicode) for x in lines):
         lines = [unicode(x) for x in lines]
     buf.write('\n'.join(lines))
-
-
-hex_pattern = re.compile('[a-f]+')
-
-
-def key_split(s):
-    """
-    >>> key_split('x')
-    u'x'
-    >>> key_split('x-1')
-    u'x'
-    >>> key_split('x-1-2-3')
-    u'x'
-    >>> key_split(('x-2', 1))
-    'x'
-    >>> key_split("('x-2', 1)")
-    u'x'
-    >>> key_split('hello-world-1')
-    u'hello-world'
-    >>> key_split(b'hello-world-1')
-    u'hello-world'
-    >>> key_split('ae05086432ca935f6eba409a8ecd4896')
-    'data'
-    >>> key_split('<module.submodule.myclass object at 0xdaf372')
-    u'myclass'
-    >>> key_split(None)
-    'Other'
-    >>> key_split('x-abcdefab')  # ignores hex
-    u'x'
-    """
-    if type(s) is bytes:
-        s = s.decode()
-    if type(s) is tuple:
-        s = s[0]
-    try:
-        words = s.split('-')
-        result = words[0].lstrip("'(\"")
-        for word in words[1:]:
-            if word.isalpha() and not (len(word) == 8 and
-                                       hex_pattern.match(word) is not None):
-                result += '-' + word
-            else:
-                break
-        if len(result) == 32 and re.match(r'[a-f0-9]{32}', result):
-            return 'data'
-        else:
-            if result[0] == '<':
-                result = result.strip('<>').split()[0].split('.')[-1]
-            return result
-    except Exception:
-        return 'Other'
 
 
 _method_cache = {}

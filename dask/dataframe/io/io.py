@@ -53,6 +53,8 @@ def _meta_from_array(x, columns=None):
         raise ValueError("For a 1d array, columns must be a scalar or single "
                          "element list")
     else:
+        if np.isnan(x.shape[1]):
+            raise ValueError("Shape along axis 1 must be known")
         if columns is None:
             columns = list(range(x.shape[1])) if x.ndim == 2 else [0]
         elif len(columns) != x.shape[1]:
@@ -428,24 +430,25 @@ def from_dask_array(x, columns=None):
     """
     meta = _meta_from_array(x, columns)
 
+    if x.ndim == 2 and len(x.chunks[1]) > 1:
+        x = x.rechunk({1: x.shape[1]})
+
     name = 'from-dask-array' + tokenize(x, columns)
-    divisions = [0]
-    for c in x.chunks[0]:
-        divisions.append(divisions[-1] + c)
-
-    index = [(np.arange, a, b, 1, 'i8') for a, b in
-             zip(divisions[:-1], divisions[1:])]
-    divisions[-1] -= 1
-
-    if x.ndim == 2:
-        if len(x.chunks[1]) > 1:
-            x = x.rechunk({1: x.shape[1]})
+    if np.isnan(sum(x.shape)):
+        divisions = [None] * (len(x.chunks[0]) + 1)
+        index = [None] * len(x.chunks[0])
+    else:
+        divisions = [0]
+        for c in x.chunks[0]:
+            divisions.append(divisions[-1] + c)
+        index = [(np.arange, a, b, 1, 'i8') for a, b in
+                 zip(divisions[:-1], divisions[1:])]
+        divisions[-1] -= 1
 
     dsk = {}
     for i, (chunk, ind) in enumerate(zip(x._keys(), index)):
         if x.ndim == 2:
             chunk = chunk[0]
-
         if isinstance(meta, pd.Series):
             dsk[name, i] = (pd.Series, chunk, ind, x.dtype, meta.name)
         else:
@@ -512,7 +515,7 @@ def to_castra(df, fn=None, categories=None, sorted_index_column=None,
     if compute:
         return DataFrame._get(dsk, keys, get=get)[0]
     else:
-        return delayed([Delayed(key, [dsk]) for key in keys])[0]
+        return delayed([Delayed(key, dsk) for key in keys])[0]
 
 
 def _df_to_bag(df, index=False):
@@ -587,7 +590,7 @@ def from_delayed(dfs, meta=None, divisions=None, prefix='from-delayed',
     $META
     divisions : tuple, str, optional
         Partition boundaries along the index.
-        For tuple, see http://dask.pydata.io/en/latest/dataframe-partitions.html
+        For tuple, see http://dask.pydata.org/en/latest/dataframe-design.html#partitions
         For string 'sorted' will compute the delayed values to find index
         values.  Assumes that the indexes are mutually sorted.
         If None, then won't use index information
@@ -600,6 +603,14 @@ def from_delayed(dfs, meta=None, divisions=None, prefix='from-delayed',
     from dask.delayed import Delayed
     if isinstance(dfs, Delayed):
         dfs = [dfs]
+    dfs = [delayed(df)
+           if not isinstance(df, Delayed) and hasattr(df, 'key')
+           else df
+           for df in dfs]
+    for df in dfs:
+        if not isinstance(df, Delayed):
+            raise TypeError("Expected Delayed object, got %s" %
+                            type(df).__name__)
     dsk = merge(df.dask for df in dfs)
 
     name = prefix + '-' + tokenize(*dfs)

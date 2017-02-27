@@ -4,6 +4,7 @@ from collections import Iterable, Iterator, defaultdict
 from functools import wraps, partial
 import itertools
 import math
+from operator import getitem
 import os
 import types
 import uuid
@@ -104,10 +105,11 @@ def inline_singleton_lists(dsk, dependencies=None):
     return dsk
 
 
-def optimize(dsk, keys, fuse_keys=None, **kwargs):
+def optimize(dsk, keys, fuse_keys=None, rename_fused_keys=True, **kwargs):
     """ Optimize a dask from a dask.bag """
     dsk2, dependencies = cull(dsk, keys)
-    dsk3, dependencies = fuse(dsk2, keys + (fuse_keys or []), dependencies)
+    dsk3, dependencies = fuse(dsk2, keys + (fuse_keys or []), dependencies,
+                              rename_keys=rename_fused_keys)
     dsk4 = inline_singleton_lists(dsk3, dependencies)
     dsk5 = lazify(dsk4)
     return dsk5
@@ -290,7 +292,9 @@ class Item(Base):
 
         See ``dask.bag.from_delayed`` for details
         """
-        from dask.delayed import Delayed
+        from dask.delayed import Delayed, delayed
+        if not isinstance(value, Delayed) and hasattr(value, 'key'):
+            value = delayed(value)
         assert isinstance(value, Delayed)
         return Item(value.dask, value.key)
 
@@ -325,7 +329,7 @@ class Item(Base):
         Returns a single value.
         """
         from dask.delayed import Delayed
-        return Delayed(self.key, [self.dask])
+        return Delayed(self.key, self.dask)
 
 
 class Bag(Base):
@@ -685,7 +689,7 @@ class Bag(Base):
         >>> sorted(b.distinct())
         ['Alice', 'Bob']
         """
-        return self.reduction(set, curry(apply, set.union), out_type=Bag,
+        return self.reduction(set, merge_distinct, out_type=Bag,
                               name='distinct')
 
     def reduction(self, perpartition, aggregate, split_every=None,
@@ -717,7 +721,8 @@ class Bag(Base):
             split_every = self.npartitions
         token = tokenize(self, perpartition, aggregate, split_every)
         a = '%s-part-%s' % (name or funcname(perpartition), token)
-        dsk = dict(((a, i), (empty_safe_apply, perpartition, (self.name, i)))
+        is_last = self.npartitions == 1
+        dsk = dict(((a, i), (empty_safe_apply, perpartition, (self.name, i), is_last))
                    for i in range(self.npartitions))
         k = self.npartitions
         b = a
@@ -725,8 +730,9 @@ class Bag(Base):
         depth = 0
         while k > 1:
             c = fmt + str(depth)
+            is_last = k <= split_every
             dsk2 = dict(((c, i), (empty_safe_aggregate, aggregate,
-                                  [(b, j) for j in inds]))
+                                  [(b, j) for j in inds], is_last))
                         for i, inds in enumerate(partition_all(split_every,
                                                                range(k))))
             dsk.update(dsk2)
@@ -1107,7 +1113,7 @@ class Bag(Base):
         Returns list of Delayed, one per partition.
         """
         from dask.delayed import Delayed
-        return [Delayed(k, [self.dask]) for k in self._keys()]
+        return [Delayed(k, self.dask) for k in self._keys()]
 
     def repartition(self, npartitions):
         """ Coalesce bag into fewer partitions
@@ -1116,23 +1122,40 @@ class Bag(Base):
         --------
         >>> b.repartition(5)  # set to have 5 partitions  # doctest: +SKIP
         """
-        if npartitions > self.npartitions:
-            msg = ("Repartition only supports going to fewer partitions\n"
-                   " old: %d  new: %d")
-            raise NotImplementedError(msg % (self.npartitions, npartitions))
-        npartitions_ratio = self.npartitions / npartitions
-        new_partitions_boundaries = [int(old_partition_index * npartitions_ratio)
-                                     for old_partition_index in range(npartitions + 1)]
-        new_name = 'repartition-%d-%s' % (npartitions, tokenize(self))
+        new_name = 'repartition-%d-%s' % (npartitions, tokenize(self, npartitions))
+        if npartitions == self.npartitions:
+            return self
+        elif npartitions < self.npartitions:
+            ratio = self.npartitions / npartitions
+            new_partitions_boundaries = [int(old_partition_index * ratio)
+                                         for old_partition_index in range(npartitions + 1)]
 
-        dsk = {}
-        for new_partition_index in range(npartitions):
-            value = (list, (toolz.concat,
-                            [(self.name, old_partition_index)
-                             for old_partition_index in
-                             range(new_partitions_boundaries[new_partition_index],
-                                   new_partitions_boundaries[new_partition_index + 1])]))
-            dsk[new_name, new_partition_index] = value
+            dsk = {}
+            for new_partition_index in range(npartitions):
+                value = (list, (toolz.concat,
+                                [(self.name, old_partition_index)
+                                 for old_partition_index in
+                                 range(new_partitions_boundaries[new_partition_index],
+                                       new_partitions_boundaries[new_partition_index + 1])]))
+                dsk[new_name, new_partition_index] = value
+        else:  # npartitions > self.npartitions
+            ratio = npartitions / self.npartitions
+            split_name = 'split-%s' % tokenize(self, npartitions)
+            dsk = {}
+            last = 0
+            j = 0
+            for i in range(self.npartitions):
+                new = last + ratio
+                if i == self.npartitions - 1:
+                    k = npartitions - j
+                else:
+                    k = int(new - last)
+                dsk[(split_name, i)] = (split, (self.name, i), k)
+                for jj in range(k):
+                    dsk[(new_name, j)] = (getitem, (split_name, i), jj)
+                    j += 1
+                last = new
+
         return Bag(dsk=merge(self.dask, dsk), name=new_name, npartitions=npartitions)
 
     def accumulate(self, binop, initial=no_default):
@@ -1416,20 +1439,32 @@ def from_delayed(values):
     --------
     dask.delayed
     """
-    from dask.delayed import Delayed
+    from dask.delayed import Delayed, delayed
     if isinstance(values, Delayed):
         values = [values]
+    values = [delayed(v)
+              if not isinstance(v, Delayed) and hasattr(v, 'key')
+              else v
+              for v in values]
     dsk = merge(v.dask for v in values)
 
     name = 'bag-from-delayed-' + tokenize(*values)
     names = [(name, i) for i in range(len(values))]
-    values = [v.key for v in values]
+    values = [(reify, v.key) for v in values]
     dsk2 = dict(zip(names, values))
 
     return Bag(merge(dsk, dsk2), name, len(values))
 
 
+def merge_distinct(seqs):
+    return set().union(*seqs)
+
+
 def merge_frequencies(seqs):
+    if isinstance(seqs, Iterable):
+        seqs = list(seqs)
+    if not seqs:
+        return {}
     first, rest = seqs[0], seqs[1:]
     if not rest:
         return first
@@ -1616,20 +1651,23 @@ def groupby_disk(b, grouper, npartitions=None, blocksize=2**20):
     return type(b)(merge(b.dask, dsk1, dsk2, dsk3, dsk4), name, npartitions)
 
 
-def empty_safe_apply(func, part):
+def empty_safe_apply(func, part, is_last):
     if isinstance(part, Iterator):
         try:
             _, part = peek(part)
-            return func(part)
         except StopIteration:
-            return no_result
+            if not is_last:
+                return no_result
+        return func(part)
+    elif not is_last and len(part) == 0:
+        return no_result
     else:
         return func(part)
 
 
-def empty_safe_aggregate(func, parts):
-    parts2 = [p for p in parts if not eq_strict(p, no_result)]
-    return empty_safe_apply(func, parts2)
+def empty_safe_aggregate(func, parts, is_last):
+    parts2 = (p for p in parts if not eq_strict(p, no_result))
+    return empty_safe_apply(func, parts2, is_last)
 
 
 def safe_take(n, b):
@@ -1676,3 +1714,18 @@ def random_state_data_python(n, random_state=None):
     maxuint32 = 1 << 32
     return [tuple(random_state.randint(0, maxuint32) for i in range(624))
             for i in range(n)]
+
+
+def split(seq, n):
+    """ Split apart a sequence into n equal pieces
+
+    >>> split(range(10), 3)
+    [[0, 1, 2], [3, 4, 5], [6, 7, 8, 9]]
+    """
+    if not isinstance(seq, (list, tuple)):
+        seq = list(seq)
+
+    part = len(seq) / n
+    L = [seq[int(part * i): int(part * (i + 1))] for i in range(n - 1)]
+    L.append(seq[int(part * (n - 1)):])
+    return L

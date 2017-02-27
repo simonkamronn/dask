@@ -2,6 +2,7 @@ import pandas as pd
 from toolz import first, partial
 
 from ..core import DataFrame, Series
+from ..utils import UNKNOWN_CATEGORIES
 from ...base import tokenize, normalize_token
 from ...compatibility import PY3
 from ...delayed import delayed
@@ -12,6 +13,7 @@ try:
     from fastparquet import parquet_thrift
     from fastparquet.core import read_row_group_file
     from fastparquet.api import _pre_allocate
+    from fastparquet.util import check_column_names
     default_encoding = parquet_thrift.Encoding.PLAIN
 except:
     fastparquet = False
@@ -71,16 +73,13 @@ def read_parquet(path, columns=None, filters=None, categories=None, index=None,
     except:
         pf = fastparquet.ParquetFile(path, open_with=myopen, sep=myopen.fs.sep)
 
+    check_column_names(pf.columns, categories)
+    categories = categories or []
     name = 'read-parquet-' + tokenize(pf, columns, categories)
 
     rgs = [rg for rg in pf.row_groups if
            not(fastparquet.api.filter_out_stats(rg, filters, pf.helper)) and
            not(fastparquet.api.filter_out_cats(rg, filters))]
-
-    # get category values from first row-group
-    categories = categories or []
-    cats = pf.grab_cats(categories)
-    categories = [cat for cat in categories if cats.get(cat, None) is not None]
 
     # Find an index among the partially sorted columns
     minmax = fastparquet.api.sorted_partitioned_columns(pf)
@@ -113,7 +112,7 @@ def read_parquet(path, columns=None, filters=None, categories=None, index=None,
     if index_col and index_col not in all_columns:
         all_columns = all_columns + (index_col,)
 
-    dtypes = {k: ('category' if k in (categories or []) else v) for k, v in
+    dtypes = {k: ('category' if k in categories else v) for k, v in
               pf.dtypes.items() if k in all_columns}
 
     meta = pd.DataFrame({c: pd.Series([], dtype=d)
@@ -121,7 +120,8 @@ def read_parquet(path, columns=None, filters=None, categories=None, index=None,
                         columns=[c for c in pf.columns if c in dtypes])
 
     for cat in categories:
-        meta[cat] = pd.Series(pd.Categorical([], categories=cats[cat]))
+        meta[cat] = pd.Series(pd.Categorical([],
+                              categories=[UNKNOWN_CATEGORIES]))
 
     if index_col:
         meta = meta.set_index(index_col)
@@ -161,7 +161,8 @@ def _read_parquet_row_group(open, fn, index, columns, rg, series, categories,
 
 
 def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
-               fixed_text=None, object_encoding=None, storage_options=None):
+               fixed_text=None, object_encoding=None, storage_options=None,
+               append=False, ignore_divisions=False):
     """
     Store Dask.dataframe to Parquet files
 
@@ -196,6 +197,13 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
         encoding is applied to all object columns.
     storage_options : dict
         Key/value pairs to be passed on to the file-system backend, if any.
+    append: bool (False)
+        If False, construct data-set from scratch; if True, add new row-group(s)
+        to existing data-set. In the latter case, the data-set must exist,
+        and the schema must match the input data.
+    ignore_divisions: bool (False)
+        If False raises error when previous divisions overlap with the new
+        appended divisions. Ignored if append=False.
 
     This uses the fastparquet project: http://fastparquet.readthedocs.io/en/latest
 
@@ -218,7 +226,11 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
     metadata_fn = sep.join([path, '_metadata'])
 
     if write_index is True or write_index is None and df.known_divisions:
+        new_divisions = df.divisions
         df = df.reset_index()
+        index_col = df.columns[0]
+    else:
+        ignore_divisions = True
 
     object_encoding = object_encoding or 'utf8'
     if object_encoding == 'infer' or (isinstance(object_encoding, dict) and
@@ -229,8 +241,43 @@ def to_parquet(path, df, compression=None, write_index=None, has_nulls=None,
                                            fixed_text=fixed_text,
                                            object_encoding=object_encoding)
 
+    if append:
+        pf = fastparquet.api.ParquetFile(path, open_with=myopen)
+        if pf.file_scheme != 'hive':
+            raise ValueError('Requested file scheme is hive, '
+                             'but existing file scheme is not.')
+        elif set(pf.columns) != set(df.columns):
+            raise ValueError('Appended columns not the same.\n'
+                             'New: {} | Previous: {}'
+                             .format(pf.columns, list(df.columns)))
+        elif set(pf.dtypes.items()) != set(df.dtypes.items()):
+            raise ValueError('Appended dtypes differ.\n{}'
+                             .format(set(pf.dtypes.items()) ^
+                                     set(df.dtypes.items())))
+        # elif fmd.schema != pf.fmd.schema:
+        #    raise ValueError('Appended schema differs.')
+        else:
+            df = df[pf.columns]
+
+        fmd = pf.fmd
+        i_offset = fastparquet.writer.find_max_part(fmd.row_groups)
+
+        if not ignore_divisions:
+            minmax = fastparquet.api.sorted_partitioned_columns(pf)
+            divisions = list(minmax[index_col]['min']) + [
+                minmax[index_col]['max'][-1]]
+
+            if new_divisions[0] < divisions[-1]:
+                raise ValueError(
+                    'Appended divisions overlapping with the previous ones.\n'
+                    'New: {} | Previous: {}'
+                    .format(divisions[-1], new_divisions[0]))
+    else:
+        i_offset = 0
+
     partitions = df.to_delayed()
-    filenames = ['part.%i.parquet' % i for i in range(len(partitions))]
+    filenames = ['part.%i.parquet' % i
+                 for i in range(i_offset, len(partitions) + i_offset)]
     outfiles = [sep.join([path, fn]) for fn in filenames]
 
     writes = [delayed(fastparquet.writer.make_part_file)(

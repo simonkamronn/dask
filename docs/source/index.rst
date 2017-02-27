@@ -233,11 +233,13 @@ often a better choice.  If you are a *core developer*, then you should start her
 
 * :doc:`support`
 * :doc:`changelog`
+* :doc:`presentations`
 * :doc:`develop`
 * :doc:`faq`
 * :doc:`spark`
 * :doc:`caching`
 * :doc:`bytes`
+* :doc:`remote-data-services`
 * :doc:`cite`
 
 .. toctree::
@@ -247,12 +249,15 @@ often a better choice.  If you are a *core developer*, then you should start her
 
    support.rst
    changelog.rst
+   presentations.rst
    develop.rst
    faq.rst
    spark.rst
    caching.rst
    bytes.rst
+   remote-data-services.rst
    cite.rst
+   funding.rst
 
 Dask is part of the Blaze_ project supported and offered by
 `Continuum Analytics`_ and contributors under a `3-clause BSD license`_.

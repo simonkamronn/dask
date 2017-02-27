@@ -845,6 +845,13 @@ def test_map_blocks_with_kwargs():
               np.array([4, 9]))
 
 
+def test_map_blocks_with_chunks():
+    dx = da.ones((5, 3), chunks=(2, 2))
+    dy = da.ones((5, 3), chunks=(2, 2))
+    dz = da.map_blocks(np.add, dx, dy, chunks=dx.chunks)
+    assert_eq(dz, np.ones((5, 3)) * 2)
+
+
 def test_map_blocks_dtype_inference():
     x = np.arange(50).reshape((5, 10))
     y = np.arange(10)
@@ -867,6 +874,7 @@ def test_map_blocks_dtype_inference():
         dx.map_blocks(foo)
     except Exception as e:
         assert e.args[0].startswith("`dtype` inference failed")
+        assert "Please specify the dtype explicitly" in e.args[0]
         assert 'RuntimeError' in e.args[0]
     else:
         assert False, "Should have errored"
@@ -2320,6 +2328,8 @@ def test_swapaxes():
     assert_eq(x.swapaxes(2, 1), d.swapaxes(2, 1))
     assert_eq(x.swapaxes(0, 0), d.swapaxes(0, 0))
     assert_eq(x.swapaxes(1, 2), d.swapaxes(1, 2))
+    assert_eq(x.swapaxes(0, -1), d.swapaxes(0, -1))
+    assert_eq(x.swapaxes(-1, 1), d.swapaxes(-1, 1))
 
     assert d.swapaxes(0, 1).name == d.swapaxes(0, 1).name
     assert d.swapaxes(0, 1).name != d.swapaxes(1, 0).name
@@ -2660,3 +2670,66 @@ def test_setitem_mixed_d():
     x[x[None, 0] > 2] = -1
     dx[dx[None, 0] > 2] = -1
     assert_eq(x, dx)
+
+
+def test_zero_slice_dtypes():
+    x = da.arange(5, chunks=1)
+    y = x[[]]
+    assert y.dtype == x.dtype
+    assert y.shape == (0,)
+    assert_eq(x[[]], np.arange(5)[[]])
+
+
+def test_zero_sized_array_rechunk():
+    x = da.arange(5, chunks=1)[:0]
+    y = da.atop(identity, 'i', x, 'i', dtype=x.dtype)
+    assert_eq(x, y)
+
+
+def test_atop_zero_shape():
+    da.atop(lambda x: x, 'i',
+            da.arange(10, chunks=10), 'i',
+            da.from_array(np.ones((0, 2)), ((), 2)), 'ab',
+            da.from_array(np.ones((0,)), ((),)), 'a',
+            dtype='float64')
+
+
+def test_atop_zero_shape_new_axes():
+    da.atop(lambda x: np.ones(42), 'i',
+            da.from_array(np.ones((0, 2)), ((), 2)), 'ab',
+            da.from_array(np.ones((0,)), ((),)), 'a',
+            dtype='float64', new_axes={'i': 42})
+
+
+def test_broadcast_against_zero_shape():
+    assert_eq(da.arange(1, chunks=1)[:0] + 0,
+              np.arange(1)[:0] + 0)
+    assert_eq(da.arange(1, chunks=1)[:0] + 0.1,
+              np.arange(1)[:0] + 0.1)
+    assert_eq(da.ones((5, 5), chunks=(2, 3))[:0] + 0,
+              np.ones((5, 5))[:0] + 0)
+    assert_eq(da.ones((5, 5), chunks=(2, 3))[:0] + 0.1,
+              np.ones((5, 5))[:0] + 0.1)
+    assert_eq(da.ones((5, 5), chunks=(2, 3))[:, :0] + 0,
+              np.ones((5, 5))[:0] + 0)
+    assert_eq(da.ones((5, 5), chunks=(2, 3))[:, :0] + 0.1,
+              np.ones((5, 5))[:0] + 0.1)
+
+
+def test_fast_from_array():
+    x = np.zeros(10000000)
+    start = time.time()
+    da.from_array(x, chunks=x.shape[0] / 10, name='x')
+    end = time.time()
+    assert end - start < 0.100
+
+
+def test_random_from_array():
+    x = np.zeros(10000000)
+    start = time.time()
+    y = da.from_array(x, chunks=x.shape[0] / 10, name=False)
+    end = time.time()
+    assert end - start < 0.100
+
+    y2 = da.from_array(x, chunks=x.shape[0] / 10, name=False)
+    assert y.name != y2.name

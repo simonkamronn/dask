@@ -4,10 +4,12 @@ import pandas as pd
 import pytest
 
 import dask
+import dask.async
 from dask.utils import tmpdir, tmpfile
 import dask.dataframe as dd
 from dask.dataframe.io.parquet import read_parquet, to_parquet
 from dask.dataframe.utils import assert_eq
+
 fastparquet = pytest.importorskip('fastparquet')
 
 
@@ -130,10 +132,99 @@ def test_categorical():
 
         ddf2 = read_parquet(tmp, categories=['x'])
 
-        assert ddf2.x.cat.categories.tolist() == ['a', 'b', 'c']
+        assert ddf2.compute().x.cat.categories.tolist() == ['a', 'b', 'c']
         ddf2.loc[:1000].compute()
         df.index.name = 'index'  # defaults to 'index' in this case
         assert assert_eq(df, ddf2)
+
+
+def test_append():
+    """Test that appended parquet equal to the original one."""
+    with tmpdir() as tmp:
+        df = pd.DataFrame({'i32': np.arange(1000, dtype=np.int32),
+                           'i64': np.arange(1000, dtype=np.int64),
+                           'f': np.arange(1000, dtype=np.float64),
+                           'bhello': np.random.choice(['hello', 'you', 'people'],
+                                                      size=1000).astype("O")})
+        df.index.name = 'index'
+
+        half = len(df) // 2
+        ddf1 = dd.from_pandas(df.iloc[:half], chunksize=100)
+        ddf2 = dd.from_pandas(df.iloc[half:], chunksize=100)
+        ddf1.to_parquet(tmp)
+        ddf2.to_parquet(tmp, append=True)
+
+        ddf3 = read_parquet(tmp)
+        assert_eq(df, ddf3)
+
+
+def test_append_wo_index():
+    """Test append with write_index=False."""
+    with tmpdir() as tmp:
+        df = pd.DataFrame({'i32': np.arange(1000, dtype=np.int32),
+                           'i64': np.arange(1000, dtype=np.int64),
+                           'f': np.arange(1000, dtype=np.float64),
+                           'bhello': np.random.choice(['hello', 'you', 'people'],
+                                                      size=1000).astype("O")})
+        half = len(df) // 2
+        ddf1 = dd.from_pandas(df.iloc[:half], chunksize=100)
+        ddf2 = dd.from_pandas(df.iloc[half:], chunksize=100)
+        ddf1.to_parquet(tmp)
+        with pytest.raises(ValueError) as excinfo:
+            ddf2.to_parquet(tmp, write_index=False, append=True)
+
+        assert 'Appended columns' in str(excinfo.value)
+
+    with tmpdir() as tmp:
+        ddf1.to_parquet(tmp, write_index=False)
+        ddf2.to_parquet(tmp, write_index=False, append=True)
+
+        ddf3 = read_parquet(tmp, index='f')
+        assert_eq(df.set_index('f'), ddf3)
+
+
+def test_append_overlapping_divisions():
+    """Test raising of error when divisions overlapping."""
+    with tmpdir() as tmp:
+        df = pd.DataFrame({'i32': np.arange(1000, dtype=np.int32),
+                           'i64': np.arange(1000, dtype=np.int64),
+                           'f': np.arange(1000, dtype=np.float64),
+                           'bhello': np.random.choice(
+                               ['hello', 'you', 'people'],
+                               size=1000).astype("O")})
+        half = len(df) // 2
+        ddf1 = dd.from_pandas(df.iloc[:half], chunksize=100)
+        ddf2 = dd.from_pandas(df.iloc[half - 10:], chunksize=100)
+        ddf1.to_parquet(tmp)
+
+        with pytest.raises(ValueError) as excinfo:
+            ddf2.to_parquet(tmp, append=True)
+
+        assert 'Appended divisions' in str(excinfo.value)
+
+        ddf2.to_parquet(tmp, append=True, ignore_divisions=True)
+
+
+def test_append_different_columns():
+    """Test raising of error when non equal columns."""
+    with tmpdir() as tmp:
+        df1 = pd.DataFrame({'i32': np.arange(100, dtype=np.int32)})
+        df2 = pd.DataFrame({'i64': np.arange(100, dtype=np.int64)})
+        df3 = pd.DataFrame({'i32': np.arange(100, dtype=np.int64)})
+
+        ddf1 = dd.from_pandas(df1, chunksize=2)
+        ddf2 = dd.from_pandas(df2, chunksize=2)
+        ddf3 = dd.from_pandas(df3, chunksize=2)
+
+        ddf1.to_parquet(tmp)
+
+        with pytest.raises(ValueError) as excinfo:
+            ddf2.to_parquet(tmp, append=True)
+        assert 'Appended columns' in str(excinfo.value)
+
+        with pytest.raises(ValueError) as excinfo:
+            ddf3.to_parquet(tmp, append=True)
+        assert 'Appended dtypes' in str(excinfo.value)
 
 
 def test_ordering():
@@ -192,3 +283,25 @@ def test_roundtrip(df, write_kwargs, read_kwargs):
         to_parquet(tmp, ddf, **write_kwargs)
         ddf2 = read_parquet(tmp, index=df.index.name, **read_kwargs)
         assert_eq(ddf, ddf2)
+
+
+def test_categories(fn):
+    df = pd.DataFrame({'x': [1, 2, 3, 4, 5],
+                       'y': list('caaab')})
+    ddf = dd.from_pandas(df, npartitions=2)
+    ddf['y'] = ddf.y.astype('category')
+    ddf.to_parquet(fn)
+    ddf2 = dd.read_parquet(fn, categories=['y'])
+    with pytest.raises(NotImplementedError):
+        ddf2.y.cat.categories
+    assert set(ddf2.y.compute().cat.categories) == {'a', 'b', 'c'}
+    cats_set = ddf2.map_partitions(lambda x: x.y.cat.categories).compute()
+    assert cats_set.tolist() == ['a', 'c', 'a', 'b']
+    assert_eq(ddf.y, ddf2.y, check_names=False)
+    with pytest.raises(dask.async.RemoteException):
+        # attempt to load as category that which is not so encoded
+        ddf2 = dd.read_parquet(fn, categories=['x']).compute()
+
+    with pytest.raises(ValueError):
+        # attempt to load as category unknown column
+        ddf2 = dd.read_parquet(fn, categories=['foo'])
